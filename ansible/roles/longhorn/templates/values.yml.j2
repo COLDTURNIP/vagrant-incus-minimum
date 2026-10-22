@@ -1,0 +1,16 @@
+---
+persistence:
+  defaultClassReplicaCount: {{ [groups['workers'] | length, 3] | min }}
+defaultSettings:
+  createDefaultDiskLabeledNodes: true
+  defaultReplicaCount: {{ [groups['workers'] | length, 3] | min }}
+  defaultDataPath: /var/lib/longhorn
+  v2DataEngine: {{ incus_enable_v2 | to_json }}
+  dataEngineHugepageEnabled: '{"v2":"{{ "true" if v2_hugepages else "false" }}"}'
+  dataEngineInterruptModeEnabled: '{"v2":"false"}'
+  allowCollectingLonghornUsageMetrics: false
+  storageReservedPercentageForDefaultDisk: 0
+  storageNetwork: {{ ('longhorn-system/' ~ storage_network_name if incus_storage_network else '') | to_json }}
+defaultBackupStore:
+  backupTarget: {{ longhorn_backup_url | to_json }}
+  backupTargetCredentialSecret: {{ ('incus-backup-credentials' if backup_target == 'garage' else '') | to_json }}

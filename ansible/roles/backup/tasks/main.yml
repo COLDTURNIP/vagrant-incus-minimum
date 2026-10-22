@@ -1,0 +1,55 @@
+---
+- name: Prepare persistent backup credentials
+  ansible.builtin.set_fact:
+    backup_access_key: longhorn-test-access-key
+    backup_secret_key: >-
+      {{ lookup('ansible.builtin.password', project_root ~ '/.state/backup-secret',
+                length=40, chars=['ascii_letters', 'digits']) }}
+    backup_rpc_secret: >-
+      {{ lookup('ansible.builtin.password', project_root ~ '/.state/garage-rpc',
+                length=64, chars=['hexdigits']) | lower }}
+  no_log: true
+  when: backup_target == 'garage'
+
+- name: Create the local test certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -newkey
+      - rsa:2048
+      - -nodes
+      - -days
+      - "365"
+      - -subj
+      - "/CN={{ backup_name }}.{{ backup_namespace }}"
+      - -addext
+      - "subjectAltName=DNS:{{ backup_name }}.{{ backup_namespace }},DNS:{{ backup_name }}.{{ backup_namespace }}.svc"
+      - -keyout
+      - "{{ project_root }}/.state/backup.key"
+      - -out
+      - "{{ project_root }}/.state/backup.crt"
+    creates: "{{ project_root }}/.state/backup.crt"
+  no_log: true
+  when: backup_target == 'garage'
+
+- name: Deploy the selected backup store
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig_path }}"
+    definition: "{{ lookup('ansible.builtin.template', backup_target ~ '.yml.j2') | from_yaml_all | list }}"
+  no_log: "{{ backup_target == 'garage' }}"
+
+- name: Wait for the backup deployment
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig_path }}"
+    api_version: apps/v1
+    kind: Deployment
+    namespace: "{{ backup_namespace }}"
+    name: "{{ backup_name }}"
+  register: backup_deployment
+  until: >-
+    backup_deployment.resources | length == 1 and
+    backup_deployment.resources[0].status.readyReplicas | default(0) | int == 1
+  retries: 60
+  delay: 5

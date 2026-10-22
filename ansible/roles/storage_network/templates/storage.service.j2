@@ -1,0 +1,13 @@
+[Unit]
+Description=Longhorn ipvlan L3 storage pod routing
+Wants=network-online.target
+After=network-online.target
+Before=k3s.service k3s-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/longhorn-storage-network
+
+[Install]
+WantedBy=multi-user.target

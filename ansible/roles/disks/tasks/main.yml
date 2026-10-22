@@ -1,0 +1,20 @@
+---
+- name: Prepare each dedicated filesystem disk
+  ansible.builtin.include_tasks: filesystem.yml
+  loop: "{{ incus_disks | dict2items | rejectattr('key', 'equalto', 'v2') | list }}"
+  loop_control:
+    loop_var: disks_item
+
+- name: Inspect the dedicated V2 disk
+  ansible.builtin.command:
+    argv: [lsblk, --nodeps, --noheadings, --output, "FSTYPE,PTTYPE", "{{ incus_disks.v2.device }}"]
+  register: disks_v2_metadata
+  changed_when: false
+  check_mode: false
+  when: "'v2' in incus_disks"
+
+- name: Reject formatted or partitioned V2 disks without wiping them
+  ansible.builtin.assert:
+    that: disks_v2_metadata.stdout | trim | length == 0
+    fail_msg: The V2 disk contains a filesystem or partition table; reset it explicitly.
+  when: "'v2' in incus_disks"

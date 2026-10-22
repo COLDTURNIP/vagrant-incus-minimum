@@ -1,0 +1,95 @@
+---
+- name: Wait for the named Incus data disk
+  ansible.builtin.wait_for:
+    path: "{{ disks_item.value.device }}"
+    timeout: 120
+
+- name: Verify the expected disk serial
+  ansible.builtin.command:
+    argv: [lsblk, --nodeps, --noheadings, --output, SERIAL, "{{ disks_item.value.device }}"]
+  register: disks_serial
+  changed_when: false
+  check_mode: false
+
+- name: Require the intended disk identity
+  ansible.builtin.assert:
+    that:
+      - disks_serial.stdout | trim == 'incus_' ~ ({'k3s':'k3s', 'logs':'logs', 'v1':'longhorn-v1'}[disks_item.key])
+    fail_msg: Refusing to format a disk with an unexpected identity.
+
+- name: Create a filesystem without overwriting an existing filesystem
+  community.general.filesystem:
+    dev: "{{ disks_item.value.device }}"
+    fstype: ext4
+    force: false
+
+- name: Read the filesystem UUID
+  ansible.builtin.command:
+    argv: [blkid, -s, UUID, -o, value, "{{ disks_item.value.device }}"]
+  register: disks_uuid
+  changed_when: false
+  check_mode: false
+
+- name: Inspect the existing exact mount point
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --mountpoint, "{{ disks_item.value.mount }}", --output, UUID]
+  register: disks_mount
+  changed_when: false
+  failed_when: disks_mount.rc not in [0, 1]
+  check_mode: false
+
+- name: Reject a conflicting mounted filesystem
+  ansible.builtin.assert:
+    that: disks_mount.rc != 0 or disks_mount.stdout | trim == disks_uuid.stdout | trim
+    fail_msg: The mount point already belongs to another disk.
+
+- name: Migrate existing data before the first mount
+  when: disks_mount.rc != 0
+  block:
+    - name: Inspect running services before moving K3s data
+      ansible.builtin.service_facts:
+
+    - name: Refuse to move data from a running K3s installation
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services.get('k3s.service', {}).get('state', '') != 'running'
+          - ansible_facts.services.get('k3s-agent.service', {}).get('state', '') != 'running'
+        fail_msg: Stop K3s explicitly before migrating its data.
+      when: disks_item.key == 'k3s'
+
+    - name: Create source and staging directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ disks_item.value.mount }}"
+        - "/mnt/incus-{{ disks_item.key }}"
+
+    - name: Temporarily mount the new disk
+      ansible.posix.mount:
+        path: "/mnt/incus-{{ disks_item.key }}"
+        src: "UUID={{ disks_uuid.stdout | trim }}"
+        fstype: ext4
+        state: ephemeral
+
+    - name: Preserve existing files on the dedicated disk
+      ansible.builtin.command:
+        argv: [rsync, -aHAX, --numeric-ids, "{{ disks_item.value.mount }}/", "/mnt/incus-{{ disks_item.key }}/"]
+      register: disks_copy
+      changed_when: true
+      failed_when: disks_copy.rc not in [0, 24]
+
+    - name: Unmount the staging path
+      ansible.posix.mount:
+        path: "/mnt/incus-{{ disks_item.key }}"
+        state: unmounted
+
+- name: Persist and mount the dedicated filesystem
+  ansible.posix.mount:
+    path: "{{ disks_item.value.mount }}"
+    src: "UUID={{ disks_uuid.stdout | trim }}"
+    fstype: ext4
+    opts: defaults
+    state: mounted
+  notify: Restart guest logging

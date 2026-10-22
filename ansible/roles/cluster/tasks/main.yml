@@ -1,0 +1,112 @@
+---
+- name: Wait for all expected Kubernetes nodes to become ready
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig_path }}"
+    api_version: v1
+    kind: Node
+    name: "{{ item }}"
+  loop: "{{ groups['servers'] + groups['workers'] }}"
+  register: cluster_node
+  until: >-
+    cluster_node.resources | default([]) | length == 1 and
+    cluster_node.resources[0].status.conditions |
+    selectattr('type', 'equalto', 'Ready') |
+    selectattr('status', 'equalto', 'True') | list | length == 1
+  retries: 120
+  delay: 5
+
+- name: Create cluster service namespaces
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig_path }}"
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item }}"
+  loop: [longhorn-system, "{{ backup_namespace }}"]
+
+- name: Label and configure worker disks before installing Longhorn
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig_path }}"
+    definition:
+      apiVersion: v1
+      kind: Node
+      metadata:
+        name: "{{ item }}"
+        labels:
+          node.longhorn.io/create-default-disk: config
+        annotations:
+          node.longhorn.io/default-disks-config: "{{ cluster_disks | to_json }}"
+  vars:
+    cluster_disks: >-
+      {{ [{'path': '/var/lib/longhorn', 'allowScheduling': true, 'storageReserved': 0}]
+         + ([{'name': 'default-v2-disk', 'path': hostvars[item].incus_disks.v2.device,
+              'allowScheduling': true, 'storageReserved': 0, 'diskType': 'block',
+              'diskDriver': 'aio'}] if incus_enable_v2 else []) }}
+  loop: "{{ groups['workers'] }}"
+
+- name: Configure the optional Multus network
+  when: incus_storage_network | bool
+  block:
+    - name: Install the pinned Multus chart with K3s
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        definition:
+          apiVersion: helm.cattle.io/v1
+          kind: HelmChart
+          metadata:
+            name: multus
+            namespace: kube-system
+          spec:
+            chart: "{{ multus_chart_url }}"
+            targetNamespace: kube-system
+            valuesContent: |
+              config:
+                fullnameOverride: multus
+                cni_conf:
+                  confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+                  binDir: /var/lib/rancher/k3s/data/cni/
+                  kubeconfig: /var/lib/rancher/k3s/agent/etc/cni/net.d/multus.d/multus.kubeconfig
+                  multusAutoconfigDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+              rke2-whereabouts:
+                enabled: false
+
+    - name: Wait for the network attachment CRD
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: network-attachment-definitions.k8s.cni.cncf.io
+      register: cluster_nad_crd
+      until: cluster_nad_crd.resources | length == 1
+      retries: 60
+      delay: 5
+
+    - name: Wait for Multus on each guest
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/k3s/data/cni/multus
+        timeout: 300
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['servers'] + groups['workers'] }}"
+
+    - name: Create the shared storage network definition
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        definition:
+          apiVersion: k8s.cni.cncf.io/v1
+          kind: NetworkAttachmentDefinition
+          metadata:
+            name: "{{ storage_network_name }}"
+            namespace: longhorn-system
+          spec:
+            config: "{{ cluster_nad | to_json }}"
+      vars:
+        cluster_nad:
+          cniVersion: "0.3.1"
+          type: flannel
+          subnetFile: /run/flannel/incus-storage.env
+          dataDir: /var/lib/cni/incus-storage
+          delegate:
+            type: ipvlan
+            master: lhstorage0
+            mode: l3

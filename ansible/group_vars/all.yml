@@ -1,0 +1,22 @@
+---
+k3s_version: v1.34.2+k3s1
+longhorn_chart_version: "1.13.0"
+install_longhorn: true
+v2_hugepages: false
+backup_target: garage  # garage, nfs, or none
+backup_namespace: longhorn-test
+backup_name: "backupstore-{{ backup_target }}"
+backup_bucket: backupbucket
+backup_region: us-east-1
+garage_image: dxflrs/garage:v2.4.1@sha256:9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020
+nginx_image: nginx:1.31.6-alpine@sha256:17ad11d84df6c69e327c0894125f712ec1f1de627b5e5ed7e12ca2ed8cd5daf8
+nfs_image: longhornio/nfs-backupstore:latest@sha256:7205d53e25c01c588c563ddab120826ee66471758d439707c03e864966bdd200
+multus_chart_url: https://raw.githubusercontent.com/rancher/rke2-charts/main/assets/rke2-multus/rke2-multus-v4.2.418.tgz
+storage_network_name: incus-storage-network
+storage_network_mtu: 1450
+project_root: "{{ playbook_dir | dirname }}"
+kubeconfig_path: "{{ project_root }}/shared/k3s.config"
+longhorn_backup_url: >-
+  {{ 's3://' ~ backup_bucket ~ '@' ~ backup_region ~ '/' if backup_target == 'garage'
+     else ('nfs://' ~ backup_name ~ '.' ~ backup_namespace ~ ':/opt/backupstore'
+           if backup_target == 'nfs' else '') }}

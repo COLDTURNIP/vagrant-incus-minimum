@@ -1,0 +1,95 @@
+---
+- name: Prepare local cluster artifacts
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate cluster inputs
+      ansible.builtin.assert:
+        that:
+          - groups['servers'] | length == 1
+          - groups['workers'] | length >= 1
+          - backup_target in ['garage', 'nfs', 'none']
+          - k3s_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+\\+k3s[0-9]+$')
+          - longhorn_chart_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+    - name: Create private local artifact directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ project_root }}/.state"
+        - "{{ project_root }}/shared"
+    - name: Inspect the persisted local cluster token
+      ansible.builtin.stat:
+        path: "{{ project_root }}/.state/k3s-token"
+      register: cluster_token_file
+    - name: Inspect the existing server configuration
+      ansible.builtin.stat:
+        path: /etc/rancher/k3s/config.yaml
+      delegate_to: "{{ groups['servers'][0] }}"
+      register: cluster_existing_config
+    - name: Refuse silent token rotation on an existing cluster
+      ansible.builtin.assert:
+        that: cluster_token_file.stat.exists or not cluster_existing_config.stat.exists
+        fail_msg: Restore the original .state/k3s-token; provisioning does not reset an existing cluster.
+    - name: Generate or reuse the cluster token
+      ansible.builtin.set_fact:
+        cluster_token: >-
+          {{ lookup('ansible.builtin.password', project_root ~ '/.state/k3s-token',
+                    length=64, chars=['ascii_letters', 'digits']) }}
+      no_log: true
+
+- name: Prepare Longhorn-ready guest systems
+  hosts: servers:workers
+  gather_facts: true
+  roles:
+    - node
+    - disks
+    - role: storage_network
+      when: incus_storage_network | bool
+
+- name: Bootstrap the K3s server
+  hosts: servers
+  gather_facts: false
+  roles:
+    - k3s
+
+- name: Join the K3s workers
+  hosts: workers
+  gather_facts: false
+  roles:
+    - k3s
+
+- name: Export kubeconfig
+  hosts: servers
+  gather_facts: false
+  tasks:
+    - name: Fetch the server kubeconfig
+      ansible.builtin.fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ kubeconfig_path }}"
+        flat: true
+      no_log: true
+
+- name: Configure Kubernetes services
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Set the host-accessible API endpoint
+      ansible.builtin.replace:
+        path: "{{ kubeconfig_path }}"
+        regexp: 'server:.*'
+        replace: "server: {{ incus_server_url }}"
+        mode: "0600"
+      no_log: true
+    - name: Configure the cluster
+      ansible.builtin.include_role:
+        name: cluster
+    - name: Configure the backup target
+      ansible.builtin.include_role:
+        name: backup
+      when: backup_target != 'none'
+    - name: Configure Longhorn
+      ansible.builtin.include_role:
+        name: longhorn
+      when: install_longhorn | bool

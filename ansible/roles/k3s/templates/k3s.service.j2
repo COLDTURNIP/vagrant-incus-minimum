@@ -1,0 +1,23 @@
+[Unit]
+Description=K3s {{ incus_role }}
+Wants=network-online.target
+After=network-online.target{% if incus_storage_network %} longhorn-storage-network.service{% endif %}
+
+{% if incus_storage_network %}
+Requires=longhorn-storage-network.service
+{% endif %}
+RequiresMountsFor=/var/lib/rancher /var/log{% if incus_role == 'worker' %} /var/lib/longhorn{% endif %}
+
+[Service]
+Type=notify
+Delegate=yes
+KillMode=process
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
+Restart=always
+RestartSec=5
+ExecStart=/usr/local/bin/k3s {{ 'server' if incus_role == 'server' else 'agent' }}
+
+[Install]
+WantedBy=multi-user.target

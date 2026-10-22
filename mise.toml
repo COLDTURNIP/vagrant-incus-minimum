@@ -2,6 +2,7 @@
 python = "3.13.16"
 opentofu = "1.13.1"
 shellcheck = "0.11.0"
+helm = "4.3.0"
 
 [settings]
 python.venv_stdlib = true
@@ -11,6 +12,9 @@ _.python.venv = { path = ".venv", create = true }
 ANSIBLE_CONFIG = "{{config_root}}/ansible.cfg"
 ANSIBLE_HOME = "{{config_root}}/.ansible"
 ANSIBLE_COLLECTIONS_PATH = "{{config_root}}/.ansible/collections"
+HELM_CACHE_HOME = "{{config_root}}/.state/helm/cache"
+HELM_CONFIG_HOME = "{{config_root}}/.state/helm/config"
+HELM_DATA_HOME = "{{config_root}}/.state/helm/data"
 
 [tasks.bootstrap]
 description = "Install pinned Python dependencies and local Ansible collections"
@@ -34,6 +38,7 @@ run = [
   "python -m pip check",
   "python -c \"import pathlib, sys; import kubernetes, yaml, jsonpatch, jmespath; assert pathlib.Path(sys.prefix) == pathlib.Path.cwd() / '.venv'; assert sys.prefix != sys.base_prefix; print('Project venv and Python imports OK')\"",
   "tofu version",
+  "helm version --short",
   "shellcheck --version",
   "ansible --version",
   "ansible localhost -i localhost, -c local -m ansible.builtin.ping -e '{\"ansible_python_interpreter\": \"{{config_root}}/.venv/bin/python\"}'",
@@ -43,3 +48,75 @@ run = [
   "ansible-doc -t inventory community.general.incus > /dev/null",
   "ansible-doc kubernetes.core.k8s > /dev/null",
 ]
+
+[tasks."validate:infra"]
+description = "Initialize provider cache and validate infrastructure without Incus"
+dir = "{{config_root}}"
+run = [
+  "tofu -chdir=infra init -backend=false -input=false -lockfile=readonly",
+  "tofu -chdir=infra fmt -check -recursive",
+  "tofu -chdir=infra validate",
+  "tofu -chdir=infra test",
+]
+
+[tasks."validate:offline"]
+description = "Test lifecycle guards and render guest templates from mock plans"
+depends = ["validate:infra"]
+dir = "{{config_root}}"
+run = "python -m unittest discover -s tests -v"
+
+[tasks."validate:ansible"]
+description = "Lint Ansible and check playbooks against mock-derived inventory"
+depends = ["validate:offline"]
+dir = "{{config_root}}"
+run = [
+  "yamllint --strict ansible collections tests .yamllint.yml",
+  "ansible-playbook -i .state/mock-inventory.json ansible/site.yml --syntax-check",
+  "ansible-playbook -i .state/mock-inventory.json ansible/verify.yml --syntax-check",
+  "ansible-lint --offline ansible/site.yml ansible/verify.yml ansible/roles",
+]
+
+[tasks.validate]
+description = "Run all local-only validation; never contact Incus or Kubernetes"
+depends = ["validate:ansible"]
+
+[tasks.init]
+description = "Initialize OpenTofu provider and state metadata; no VMs"
+dir = "{{config_root}}"
+run = "python scripts/lab.py init"
+
+[tasks.plan]
+description = "Read Incus and host routes; plan and check network collisions"
+dir = "{{config_root}}"
+run = "python scripts/lab.py plan"
+
+[tasks.apply]
+description = "Create infrastructure; requires --confirm PROJECT; refuses replacements"
+dir = "{{config_root}}"
+run = "python scripts/lab.py apply"
+
+[tasks.inventory]
+description = "Regenerate inventory from applied OpenTofu outputs"
+dir = "{{config_root}}"
+run = "python scripts/lab.py inventory"
+
+[tasks.provision]
+description = "Converge guests and Kubernetes; requires already-created infrastructure"
+dir = "{{config_root}}"
+run = "python scripts/lab.py provision"
+
+[tasks.verify]
+description = "Read-only live guest and Kubernetes readiness checks"
+dir = "{{config_root}}"
+run = "python scripts/lab.py verify"
+
+[tasks.destroy]
+description = "DELETE cluster VMs, data volumes and owned bridges; --confirm PROJECT required"
+dir = "{{config_root}}"
+run = "python scripts/lab.py destroy"
+
+[tasks."validate:charts"]
+description = "Download pinned Helm charts and render them without Kubernetes"
+depends = ["validate:offline"]
+dir = "{{config_root}}"
+run = "python scripts/validate_charts.py"

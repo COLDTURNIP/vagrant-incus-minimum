@@ -1,0 +1,89 @@
+---
+- name: Require a supported guest
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Ubuntu'
+      - ansible_facts.architecture in ['x86_64', 'aarch64']
+      - not incus_enable_v2 or ansible_facts.kernel.split('-')[0] is version('6.7', '>=')
+    fail_msg: Use an Ubuntu cloud image with the required Longhorn kernel modules.
+
+- name: Install node dependencies
+  ansible.builtin.apt:
+    name:
+      - chrony
+      - cryptsetup
+      - curl
+      - jq
+      - nfs-common
+      - open-iscsi
+      - rsync
+      - util-linux
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Inspect availability of extra kernel modules
+  ansible.builtin.command:
+    argv: [apt-cache, show, "linux-modules-extra-{{ ansible_facts.kernel }}"]
+  register: node_kernel_extra
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Install extra kernel modules when packaged
+  ansible.builtin.apt:
+    name: "linux-modules-extra-{{ ansible_facts.kernel }}"
+  when: node_kernel_extra.rc == 0
+
+- name: Load and persist Longhorn kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+    persistent: present
+  loop: >-
+    {{ ['iscsi_tcp', 'nfs', 'dm_crypt', 'loop', 'br_netfilter', 'overlay']
+       + (['nvme_tcp', 'uio_pci_generic', 'vfio_pci'] if incus_enable_v2 else []) }}
+
+- name: Inspect optional multipath service
+  ansible.builtin.service_facts:
+
+- name: Disable multipath on disposable guests
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop: [multipathd.service, multipathd.socket]
+  when: item in ansible_facts.services
+
+- name: Enable iSCSI and time synchronization
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [iscsid, chrony]
+
+- name: Configure guest forwarding and huge pages
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value | string }}"
+    sysctl_file: /etc/sysctl.d/90-longhorn.conf
+    sysctl_set: true
+    reload: true
+  loop: "{{ node_sysctls | dict2items }}"
+  vars:
+    node_sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv6.conf.all.forwarding: 1
+      net.bridge.bridge-nf-call-iptables: 1
+      net.bridge.bridge-nf-call-ip6tables: 1
+      vm.nr_hugepages: "{{ 1024 if incus_enable_v2 and v2_hugepages and incus_role == 'worker' else 0 }}"
+
+- name: Disable active swap
+  ansible.builtin.command: swapoff -a
+  when: ansible_facts.swaptotal_mb | int > 0
+  changed_when: true
+
+- name: Disable swap entries across reboots
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# Disabled for Kubernetes: \1'

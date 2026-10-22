@@ -1,0 +1,162 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ backup_name }}
+  namespace: {{ backup_namespace }}
+type: Opaque
+stringData:
+  access-key: {{ backup_access_key | to_json }}
+  secret-key: {{ backup_secret_key | to_json }}
+  tls.crt: {{ lookup('ansible.builtin.file', project_root ~ '/.state/backup.crt') | to_json }}
+  tls.key: {{ lookup('ansible.builtin.file', project_root ~ '/.state/backup.key') | to_json }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: incus-backup-credentials
+  namespace: longhorn-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: {{ backup_access_key | to_json }}
+  AWS_SECRET_ACCESS_KEY: {{ backup_secret_key | to_json }}
+  AWS_ENDPOINTS: "https://{{ backup_name }}.{{ backup_namespace }}:9000"
+  AWS_CERT: {{ lookup('ansible.builtin.file', project_root ~ '/.state/backup.crt') | to_json }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ backup_name }}
+  namespace: {{ backup_namespace }}
+data:
+  garage.toml: |
+    metadata_dir = "/data/meta"
+    data_dir = "/data/data"
+    db_engine = "sqlite"
+    replication_factor = 1
+    rpc_bind_addr = "127.0.0.1:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+    rpc_secret = "{{ backup_rpc_secret }}"
+    [s3_api]
+    s3_region = "{{ backup_region }}"
+    api_bind_addr = "127.0.0.1:3900"
+    root_domain = ".s3.garage.localhost"
+  nginx.conf: |
+    events {}
+    http {
+      server {
+        listen 9000 ssl;
+        listen [::]:9000 ssl;
+        ssl_certificate /certs/tls.crt;
+        ssl_certificate_key /certs/tls.key;
+        client_max_body_size 0;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        location / {
+          proxy_pass http://127.0.0.1:3900;
+          proxy_http_version 1.1;
+          proxy_set_header Host $http_host;
+          proxy_set_header Connection "";
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ backup_name }}
+  namespace: {{ backup_namespace }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ backup_name }}
+  template:
+    metadata:
+      labels:
+        app: {{ backup_name }}
+      annotations:
+        incus/config-hash: {{ (backup_secret_key ~ backup_rpc_secret ~ backup_region ~ backup_bucket) | hash('sha256') | to_json }}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: {{ groups['servers'][0] }}
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: garage
+          image: {{ garage_image }}
+          command: [/garage, server]
+          args: [--single-node, --default-bucket]
+          env:
+            - name: GARAGE_CONFIG_FILE
+              value: /etc/garage.toml
+            - name: GARAGE_DEFAULT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ backup_name }}
+                  key: access-key
+            - name: GARAGE_DEFAULT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ backup_name }}
+                  key: secret-key
+            - name: GARAGE_DEFAULT_BUCKET
+              value: {{ backup_bucket }}
+          readinessProbe:
+            exec:
+              command: [/garage, status]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+              readOnly: true
+        - name: nginx
+          image: {{ nginx_image }}
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: certificates
+              mountPath: /certs
+              readOnly: true
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/rancher/incus-backupstore/garage
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: {{ backup_name }}
+        - name: certificates
+          secret:
+            secretName: {{ backup_name }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ backup_name }}
+  namespace: {{ backup_namespace }}
+spec:
+  selector:
+    app: {{ backup_name }}
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000

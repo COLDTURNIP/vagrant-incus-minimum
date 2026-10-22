@@ -1,0 +1,43 @@
+"""Download pinned charts and render locally; never access Kubernetes."""
+
+from pathlib import Path
+import subprocess
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+defaults = yaml.safe_load((ROOT / "ansible/group_vars/all.yml").read_text())
+charts = ROOT / ".state/charts"
+charts.mkdir(parents=True, exist_ok=True)
+version = defaults["longhorn_chart_version"]
+subprocess.run([
+    "helm", "pull", "longhorn", "--repo", "https://charts.longhorn.io",
+    "--version", version, "--destination", str(charts),
+], cwd=ROOT, check=True)
+values_files = sorted((ROOT / ".state/rendered").glob("longhorn-*-v2-*.yml"))
+if not values_files:
+    raise RuntimeError("Run mise run validate:offline first")
+for values in values_files:
+    result = subprocess.run([
+        "helm", "template", "longhorn", str(charts / ("longhorn-" + version + ".tgz")),
+        "--namespace", "longhorn-system", "--values", str(values),
+    ], cwd=ROOT, check=True, text=True, capture_output=True)
+    documents = list(yaml.safe_load_all(result.stdout))
+    settings = [doc for doc in documents if doc and doc.get("kind") == "ConfigMap"
+                and any("v2-data-engine" in str(value) for value in doc.get("data", {}).values())]
+    if not settings:
+        raise RuntimeError("Chart did not render expected Longhorn default settings")
+    print("Longhorn chart OK: " + values.name)
+result = subprocess.run([
+    "helm", "template", "multus", defaults["multus_chart_url"],
+    "--namespace", "kube-system",
+    "--set", "config.fullnameOverride=multus",
+    "--set", "config.cni_conf.confDir=/var/lib/rancher/k3s/agent/etc/cni/net.d",
+    "--set", "config.cni_conf.binDir=/var/lib/rancher/k3s/data/cni/",
+    "--set", "config.cni_conf.kubeconfig=/var/lib/rancher/k3s/agent/etc/cni/net.d/multus.d/multus.kubeconfig",
+    "--set", "config.cni_conf.multusAutoconfigDir=/var/lib/rancher/k3s/agent/etc/cni/net.d",
+    "--set", "rke2-whereabouts.enabled=false",
+], cwd=ROOT, check=True, text=True, capture_output=True)
+if not any(doc and doc.get("kind") == "DaemonSet" for doc in yaml.safe_load_all(result.stdout)):
+    raise RuntimeError("Multus chart did not render a DaemonSet")
+print("Multus chart OK")

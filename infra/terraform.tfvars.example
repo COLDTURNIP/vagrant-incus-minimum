@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (ignored). Review every network for host/VPN overlap.
+project                = "lh-incus"
+storage_pool           = "default"
+image                  = "images:ubuntu/24.04/cloud"
+network_stack          = "dual" # ipv4, ipv6, dual, dual6
+worker_count           = 3
+enable_v2              = true
+enable_storage_network = false
+# shared_directory = "/absolute/path/on/incus/host"

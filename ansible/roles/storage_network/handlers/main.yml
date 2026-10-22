@@ -1,0 +1,7 @@
+---
+- name: Restart storage routing
+  ansible.builtin.systemd_service:
+    name: longhorn-storage-network
+    state: restarted
+    enabled: true
+    daemon_reload: true

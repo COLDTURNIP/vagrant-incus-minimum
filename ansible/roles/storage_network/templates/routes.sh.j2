@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+mkdir -p /run/flannel
+cat > /run/flannel/incus-storage.env <<'EOF'
+FLANNEL_MTU={{ storage_network_mtu }}
+FLANNEL_IPMASQ=true
+{% if incus_network_stack != 'ipv6' %}
+FLANNEL_NETWORK={{ incus_storage_ipv4_cidr }}
+FLANNEL_SUBNET={{ incus_storage_v4 }}
+{% endif %}
+{% if incus_network_stack != 'ipv4' %}
+FLANNEL_IPV6_NETWORK={{ incus_storage_ipv6_cidr }}
+FLANNEL_IPV6_SUBNET={{ incus_storage_v6 }}
+{% endif %}
+EOF
+{% for name, peer in incus_peers | dictsort %}
+{% if incus_network_stack != 'ipv6' %}
+ip route replace unreachable {{ peer.incus_storage_v4 }} metric 32760
+{% if name != inventory_hostname %}
+ip route replace {{ peer.incus_storage_v4 }} via {{ peer.incus_ipv4 }} dev lhstorage0
+{% endif %}
+{% endif %}
+{% if incus_network_stack != 'ipv4' %}
+ip -6 route replace unreachable {{ peer.incus_storage_v6 }} metric 32760
+{% if name != inventory_hostname %}
+ip -6 route replace {{ peer.incus_storage_v6 }} via {{ peer.incus_ipv6 }} dev lhstorage0
+{% endif %}
+{% endif %}
+{% endfor %}

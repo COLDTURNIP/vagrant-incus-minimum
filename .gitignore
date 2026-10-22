@@ -1,8 +1,12 @@
 /.venv/
 /.ansible/
+/.state/
+/tests/.rendered/
 /.mise/
-/.terraform/
+.terraform/
 /.terraform.d/
+*.tfvars
+*.tfvars.json
 /.ruff_cache/
 /.pytest_cache/
 /__pycache__/

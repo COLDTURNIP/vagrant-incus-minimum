@@ -1,0 +1,50 @@
+---
+- name: Verify guest prerequisites without changing them
+  hosts: servers:workers
+  gather_facts: false
+  tasks:
+    - name: Verify the K3s service is active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, "{{ 'k3s' if incus_role == 'server' else 'k3s-agent' }}"]
+      changed_when: false
+    - name: Verify each dedicated filesystem is mounted
+      ansible.builtin.command:
+        argv: [findmnt, --mountpoint, "{{ item.value.mount }}", --output, "SOURCE,UUID,FSTYPE"]
+      loop: "{{ incus_disks | dict2items | rejectattr('key', 'equalto', 'v2') | list }}"
+      changed_when: false
+    - name: Verify V2 kernel modules when enabled
+      ansible.builtin.command:
+        argv: [test, -d, "/sys/module/{{ item }}"]
+      loop: [nvme_tcp, uio_pci_generic, vfio_pci]
+      when: incus_enable_v2 | bool
+      changed_when: false
+
+- name: Verify Kubernetes readiness
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Reuse readiness checks and describe nodes
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Node
+        name: "{{ item }}"
+      loop: "{{ groups['servers'] + groups['workers'] }}"
+      register: verification_node
+      failed_when: >-
+        verification_node.resources | length != 1 or
+        verification_node.resources[0].status.conditions |
+        selectattr('type', 'equalto', 'Ready') |
+        selectattr('status', 'equalto', 'True') | list | length != 1
+    - name: Inspect Longhorn daemonset readiness
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: DaemonSet
+        name: longhorn-manager
+        namespace: longhorn-system
+      register: verification_manager
+      failed_when: >-
+        verification_manager.resources | length != 1 or
+        verification_manager.resources[0].status.numberReady | default(0) < groups['workers'] | length
+      when: install_longhorn | bool
