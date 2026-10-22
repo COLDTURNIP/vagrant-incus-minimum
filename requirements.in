@@ -1,0 +1,8 @@
+# Direct dependencies. Bootstrap uses the fully pinned requirements.txt.
+ansible-core
+ansible-lint
+yamllint
+kubernetes
+jsonpatch
+jmespath
+PyYAML

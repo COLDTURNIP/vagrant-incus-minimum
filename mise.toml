@@ -1,0 +1,45 @@
+[tools]
+python = "3.13.16"
+opentofu = "1.13.1"
+shellcheck = "0.11.0"
+
+[settings]
+python.venv_stdlib = true
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+ANSIBLE_CONFIG = "{{config_root}}/ansible.cfg"
+ANSIBLE_HOME = "{{config_root}}/.ansible"
+ANSIBLE_COLLECTIONS_PATH = "{{config_root}}/.ansible/collections"
+
+[tasks.bootstrap]
+description = "Install pinned Python dependencies and local Ansible collections"
+depends = ["deps:collections"]
+
+[tasks."deps:python"]
+description = "Install the pinned Python requirements into the project venv"
+dir = "{{config_root}}"
+run = "python -m pip install -r requirements.txt"
+
+[tasks."deps:collections"]
+description = "Install the pinned Ansible collections into the project"
+depends = ["deps:python"]
+dir = "{{config_root}}"
+run = "ansible-galaxy collection install -r collections/requirements.yml -p .ansible/collections"
+
+[tasks.check]
+description = "Check the local toolchain without contacting Incus or Kubernetes"
+dir = "{{config_root}}"
+run = [
+  "python -m pip check",
+  "python -c \"import pathlib, sys; import kubernetes, yaml, jsonpatch, jmespath; assert pathlib.Path(sys.prefix) == pathlib.Path.cwd() / '.venv'; assert sys.prefix != sys.base_prefix; print('Project venv and Python imports OK')\"",
+  "tofu version",
+  "shellcheck --version",
+  "ansible --version",
+  "ansible localhost -i localhost, -c local -m ansible.builtin.ping -e '{\"ansible_python_interpreter\": \"{{config_root}}/.venv/bin/python\"}'",
+  "ansible-lint --version",
+  "yamllint --strict collections/requirements.yml",
+  "ansible-doc -t connection community.general.incus > /dev/null",
+  "ansible-doc -t inventory community.general.incus > /dev/null",
+  "ansible-doc kubernetes.core.k8s > /dev/null",
+]
