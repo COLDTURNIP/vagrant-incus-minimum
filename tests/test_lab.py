@@ -145,6 +145,52 @@ class OfflineTests(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[:2], ("output", "-json"))
 
+    def test_strict_longhorn_health_gate_with_ansible(self):
+        playbook = yaml.safe_load((ROOT / "ansible/verify.yml").read_text())
+        gate = next(task for task in playbook[1]["tasks"]
+                    if task["name"] == "Require every Longhorn node and disk condition to be green")
+        node = {"metadata": {"name": "test-worker"}, "status": {
+            "conditions": [{"type": str(i), "status": "True"} for i in range(8)],
+            "diskStatus": {name: {"conditions": [
+                {"type": "Ready", "status": "True"},
+                {"type": "Schedulable", "status": "True"}]} for name in ("v1", "v2")}}}
+        hugepages_off = {"type": "HugePagesAvailable", "status": "False", "reason": "HugePagesNotConfigured"}
+        # (case, hugepages enabled, expected to pass)
+        cases = (("green", False, True),
+                 ("extra-true-disk-condition", False, True),
+                 ("hugepages-disabled", False, True),
+                 ("hugepages-enabled", True, False),
+                 ("smart-unsupported", False, True),
+                 ("node-condition", False, False),
+                 ("disk-ready", False, False))
+        for case, hugepages, expected in cases:
+            with self.subTest(case=case):
+                sample = copy.deepcopy(node)
+                conditions = sample["status"]["conditions"]
+                disks = sample["status"]["diskStatus"]
+                if case == "extra-true-disk-condition":
+                    disks["v1"]["conditions"].append({"type": "HealthDataCollected", "status": "True"})
+                elif case.startswith("hugepages"):
+                    conditions[-1] = hugepages_off
+                elif case == "smart-unsupported":
+                    for disk in disks.values():
+                        disk["conditions"].append({"type": "HealthDataCollected", "status": "False",
+                                                   "reason": "HealthDataCollectionFailed"})
+                elif case == "node-condition":
+                    conditions[-1] = {"type": "Multipathd", "status": "False", "reason": "MultipathdIsRunning"}
+                elif case == "disk-ready":
+                    disks["v2"]["conditions"][0]["status"] = "False"
+                play = [{"name": "Check strict node health", "hosts": "localhost",
+                         "gather_facts": False, "vars": {"install_longhorn": True,
+                             "incus_enable_v2": True, "v2_hugepages": hugepages,
+                             "verification_longhorn_nodes": {"resources": [sample]}},
+                         "tasks": [gate]}]
+                path = lab.STATE / "node-health-test.yml"
+                path.write_text(yaml.safe_dump(play), encoding="ascii")
+                result = subprocess.run(["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+                                        cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, expected, result.stdout)
+
     def test_master_head_manifest_customization_with_ansible(self):
         tasks = yaml.safe_load((ROOT / "ansible/roles/longhorn/tasks/manifest.yml").read_text())
         names = ("Parse the manifest documents",

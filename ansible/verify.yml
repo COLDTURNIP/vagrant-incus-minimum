@@ -12,6 +12,13 @@
         argv: [findmnt, --mountpoint, "{{ item.value.mount }}", --output, "SOURCE,UUID,FSTYPE"]
       loop: "{{ incus_disks | dict2items | rejectattr('key', 'equalto', 'v2') | list }}"
       changed_when: false
+    - name: Verify hugepages remain unallocated when disabled
+      ansible.builtin.command:
+        argv: [sysctl, -n, vm.nr_hugepages]
+      register: verification_hugepages
+      changed_when: false
+      failed_when: verification_hugepages.stdout | trim != '0'
+      when: not v2_hugepages | bool
     - name: Verify V2 kernel modules when enabled
       ansible.builtin.command:
         argv: [test, -d, "/sys/module/{{ item }}"]
@@ -47,4 +54,82 @@
       failed_when: >-
         verification_manager.resources | length != 1 or
         verification_manager.resources[0].status.numberReady | default(0) < groups['workers'] | length
+      when: install_longhorn | bool
+
+    - name: Inspect the configured Longhorn storage network
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: longhorn.io/v1beta2
+        kind: Setting
+        name: storage-network
+        namespace: longhorn-system
+      register: verification_storage_network
+      failed_when: >-
+        verification_storage_network.resources | length != 1 or
+        verification_storage_network.resources[0].value != 'longhorn-system/' ~ storage_network_name
+      when: install_longhorn | bool and incus_storage_network | bool
+
+    - name: Inspect the Longhorn hugepage setting
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: longhorn.io/v1beta2
+        kind: Setting
+        name: data-engine-hugepage-enabled
+        namespace: longhorn-system
+      register: verification_hugepage_setting
+      failed_when: >-
+        verification_hugepage_setting.resources | length != 1 or
+        (verification_hugepage_setting.resources[0].value | from_json).v2 != 'false'
+      when: install_longhorn | bool and incus_enable_v2 | bool and not v2_hugepages | bool
+
+    - name: Inspect every Longhorn Node CR
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: longhorn.io/v1beta2
+        kind: Node
+        namespace: longhorn-system
+      register: verification_longhorn_nodes
+      when: install_longhorn | bool
+
+    - name: Require the expected Longhorn workers
+      ansible.builtin.assert:
+        that:
+          - verification_longhorn_nodes.resources | map(attribute='metadata.name') | sort == groups['workers'] | sort
+      when: install_longhorn | bool
+
+    - name: Require every Longhorn node and disk condition to be green
+      ansible.builtin.assert:
+        that:
+          - item.status.conditions | default([]) | length >= (8 if incus_enable_v2 else 7)
+          - verification_node_failures | length == 0
+          - item.status.diskStatus | default({}) | length == (2 if incus_enable_v2 else 1)
+          - verification_disk_conditions | selectattr('type', 'in', ['Ready', 'Schedulable']) | list | length == (4 if incus_enable_v2 else 2)
+          - verification_disk_failures | length == 0
+        fail_msg: >-
+          Longhorn Node CR {{ item.metadata.name }} is not all-green:
+          {{ verification_node_failures }}; disks: {{ verification_disk_failures }}
+      vars:
+        # HugePagesAvailable: when V2 hugepages are disabled, SPDK runs with
+        # --no-huge and needs none. Longhorn (v1.13.0 and master-head) still
+        # tests node hugepage capacity whenever V2 is enabled, ignoring the
+        # data-engine-hugepage-enabled setting, so the condition is a false
+        # negative here. It is still enforced when v2_hugepages is true.
+        verification_ignored_node_conditions: "{{ [] if v2_hugepages | bool else ['HugePagesAvailable'] }}"
+        # HealthDataCollected: disk health monitoring (newer Longhorn) reads
+        # SMART data. QEMU virtual disks report no SMART support, so smartctl
+        # exits 4 and collection always fails in these VMs. Disk Ready and
+        # Schedulable are still required.
+        verification_ignored_disk_conditions: [HealthDataCollected]
+        verification_node_failures: >-
+          {{ item.status.conditions | default([]) | rejectattr('status', 'equalto', 'True')
+             | rejectattr('type', 'in', verification_ignored_node_conditions) | list }}
+        verification_disk_conditions: >-
+          {{ item.status.diskStatus | default({}) | dict2items |
+             map(attribute='value.conditions') | flatten }}
+        verification_disk_failures: >-
+          {{ verification_disk_conditions | rejectattr('status', 'equalto', 'True')
+             | rejectattr('type', 'in', verification_ignored_disk_conditions) | list }}
+      loop: "{{ verification_longhorn_nodes.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
       when: install_longhorn | bool
