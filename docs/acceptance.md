@@ -1,6 +1,12 @@
 # Live acceptance checks
 
-Status: not executed. These checks mutate only an approved disposable Incus
+The [initial live run](live-validation.md) passed storage networking and V1/V2
+I/O but is not complete acceptance. `mise run verify` requires every Longhorn
+node and disk condition to be True except two documented false negatives:
+HugePagesAvailable while V2 hugepages are disabled, and HealthDataCollected
+because QEMU virtual disks have no SMART support. Do not patch status fields.
+
+Status: partially executed; full matrix pending. These checks mutate only an approved disposable Incus
 cluster and its explicitly named test volumes. They do not authorize changing
 another cluster, the host firewall, existing pools, or Vagrant resources.
 
