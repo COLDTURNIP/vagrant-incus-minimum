@@ -32,6 +32,13 @@ IMAGE_SOURCES = ("images", "official")
 # Changing these replaces VMs or the network layout, which apply refuses.
 RECREATE_KEYS = ("ubuntu", "image_source", "ip_family", "storage_network")
 OFFICIAL_IMAGES = "https://cloud-images.ubuntu.com/releases/{ubuntu}/release/"
+# Per-cluster local files. Removed by down and before a fresh cluster is created,
+# so a new cluster never inherits a token, credentials, or certificates.
+CLUSTER_FILES = (
+    INVENTORY, APPLIED_SPEC, STATE / "k3s-token", STATE / "backup-secret", STATE / "garage-rpc",
+    STATE / "backup.key", STATE / "backup.crt", ROOT / "shared" / "k3s.config",
+    ROOT / "shared" / "longhorn-values.yml", ROOT / "shared" / "longhorn-manifest.yml",
+)
 
 
 def run(args, *, capture=False):
@@ -155,7 +162,7 @@ def refuse_recreation(spec, applied):
             changed.append(f"{key} {applied[key]!r} -> {spec[key]!r} (downgrades are unsupported)")
     if changed:
         raise ValueError("These changes need a fresh cluster: " + "; ".join(changed)
-                         + ". Run mise run down -- --confirm PROJECT, then mise run up.")
+                         + ". Run mise run down, then mise run up.")
 
 
 def record_applied(spec, *keys):
@@ -236,6 +243,25 @@ def refuse_deletions(plan):
     if deletions:
         raise ValueError("Apply refuses deletions/replacements: " + ", ".join(deletions)
                          + ". Review the plan; use an explicit full destroy/recreate instead.")
+
+
+def require_fresh_disks(plan):
+    """A VM created by this plan must get newly created data volumes, never existing ones."""
+    actions = {change["address"]: change["change"]["actions"] for change in plan.get("resource_changes", [])}
+    created = [address for address, action in actions.items()
+               if address.startswith("incus_instance.node[") and action == ["create"]]
+    for address in created:
+        node = address.split('"')[1]
+        reused = [volume for volume, action in actions.items()
+                  if volume.startswith(f'incus_storage_volume.data["{node}-') and action != ["create"]]
+        if reused:
+            raise ValueError(f"{address} would reuse existing data volumes {', '.join(reused)}; "
+                             "run mise run down and create the cluster from scratch.")
+
+
+def clear_cluster_files():
+    for path in CLUSTER_FILES:
+        path.unlink(missing_ok=True)
 
 
 def preflight(plan):
@@ -323,27 +349,44 @@ def apply_infrastructure(spec, confirm):
     plan = plan_infrastructure(var_file=write_tofu_spec(spec))
     project = preflight(plan)
     refuse_deletions(plan)
+    require_fresh_disks(plan)
     require_confirmation(project, confirm)
+    if any(change["type"] == "incus_project" and change["change"]["actions"] == ["create"]
+           for change in plan.get("resource_changes", [])):
+        # A new project means a new cluster: drop anything left from an older one.
+        clear_cluster_files()
     tofu("apply", "-input=false", str(PLAN))
     record_applied(spec, *RECREATE_KEYS)
     inventory()
 
 
-def destroy(confirm):
-    topology = json.loads(tofu("output", "-json", "topology", capture=True))
-    require_confirmation(topology["project"], confirm)
-    plan_infrastructure(destroy=True)
-    tofu("apply", "-input=false", str(PLAN))
-    INVENTORY.unlink(missing_ok=True)
-    APPLIED_SPEC.unlink(missing_ok=True)
-    (ROOT / "shared" / "k3s.config").unlink(missing_ok=True)
+def project_name():
+    return json.loads(tofu("output", "-json", "topology", capture=True))["project"]
+
+
+def destroy():
+    """Force teardown, like vagrant destroy -f: no prompt, no data preservation."""
+    if tofu("state", "list", capture=True).strip():
+        project = project_name()
+        if project == "default":
+            raise ValueError("Refusing to tear down the default Incus project")
+        # Graceful guest shutdown only slows teardown of disposable VMs.
+        instances = json.loads(run(["incus", "list", "local:", "--project", project, "--format", "json"],
+                                   capture=True))
+        running = [item["name"] for item in instances if item["status"] == "Running"]
+        if running:
+            run(["incus", "stop", "--force", *(f"local:{name}" for name in running), "--project", project])
+        tofu("apply", "-destroy", "-auto-approve", "-input=false")
+    clear_cluster_files()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["init", "plan", "apply", "inventory", "provision", "verify",
-                                            "destroy", "up", "down", "import-image"])
-    parser.add_argument("--confirm", help="Exact project name for apply, up, or destructive destroy/down")
+                                            "destroy", "down", "up", "import-image", "shell"])
+    parser.add_argument("node", nargs="?", default="server",
+                        help="shell only: server, worker<N>, or a full instance name")
+    parser.add_argument("--confirm", help="Exact project name for apply or up")
     overrides = parser.add_argument_group("per-run overrides of cluster.yml (not persisted)")
     overrides.add_argument("--ubuntu", help="Ubuntu release, for example 24.04")
     overrides.add_argument("--image-source", choices=IMAGE_SOURCES)
@@ -357,7 +400,12 @@ def main(argv=None):
             raise ValueError(f"Missing required command: {program}; run through mise")
     if args.command in ("destroy", "down"):
         # Teardown uses state only, so an invalid cluster.yml cannot block it.
-        destroy(args.confirm)
+        destroy()
+        return
+    if args.command == "shell":
+        project = project_name()
+        name = args.node if args.node.startswith(project + "-") else f"{project}-{args.node}"
+        os.execvp("incus", ["incus", "shell", f"local:{name}", "--project", project])
         return
     if args.command in ("init", "inventory"):
         if args.command == "init":

@@ -147,15 +147,81 @@ class OfflineTests(unittest.TestCase):
                 lab.main(["apply", "--confirm", "lh-incus"])
             command.assert_not_called()
 
-    def test_unconfirmed_destroy_never_plans_or_applies(self):
+    def test_down_force_destroys_and_clears_cluster_files(self):
+        cluster_files = [self.scratch / name for name in ("k3s-token", "backup.key", "k3s.config")]
+        instances = json.dumps([{"name": "lh-incus-server", "status": "Running"},
+                                {"name": "lh-incus-worker1", "status": "Stopped"}])
+        for command_name in ("down", "destroy"):
+            with self.subTest(command=command_name):
+                for path in cluster_files:
+                    path.write_text("old cluster")
+                with patch.object(lab, "CLUSTER_FILES", tuple(cluster_files)), \
+                     patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+                     patch.object(lab, "tofu", side_effect=["incus_project.cluster\n", '{"project":"lh-incus"}', ""]) as command, \
+                     patch.object(lab, "run", side_effect=[instances, ""]) as incus:
+                    lab.main([command_name])
+                self.assertEqual(incus.call_args_list[1].args[0],
+                                 ["incus", "stop", "--force", "local:lh-incus-server", "--project", "lh-incus"])
+                self.assertEqual(command.call_args_list[2].args, ("apply", "-destroy", "-auto-approve", "-input=false"))
+                self.assertFalse(any(path.exists() for path in cluster_files))
         with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
-             patch.object(lab, "tofu", return_value='{"project":"lh-incus"}') as command, \
-             patch.object(lab, "plan_infrastructure") as planning:
-            with self.assertRaises(ValueError):
-                lab.main(["destroy"])
-            planning.assert_not_called()
-            self.assertEqual(command.call_count, 1)
-            self.assertEqual(command.call_args.args[:2], ("output", "-json"))
+             patch.object(lab, "tofu", side_effect=["incus_project.cluster\n", '{"project":"default"}']), \
+             patch.object(lab, "run") as incus:
+            with self.assertRaisesRegex(ValueError, "default Incus project"):
+                lab.main(["down"])
+            incus.assert_not_called()
+        with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+             patch.object(lab, "CLUSTER_FILES", tuple(cluster_files)), \
+             patch.object(lab, "tofu", return_value="") as command:
+            lab.main(["down"])
+        command.assert_called_once_with("state", "list", capture=True)
+
+    def test_new_vms_never_reuse_existing_data_volumes(self):
+        lab.require_fresh_disks(self.plans[0])
+        plan = copy.deepcopy(self.plans[0])
+        volume = next(c for c in plan["resource_changes"]
+                      if c["address"].startswith('incus_storage_volume.data["worker1-'))
+        volume["change"]["actions"] = ["no-op"]
+        with self.assertRaisesRegex(ValueError, 'incus_instance.node\\["worker1"\\] would reuse'):
+            lab.require_fresh_disks(plan)
+
+    def test_fresh_cluster_creation_clears_old_cluster_files(self):
+        stale = self.scratch / "k3s-token"
+        stale.write_text("old cluster")
+        with patch.object(lab, "CLUSTER_FILES", (stale,)), \
+             patch.object(lab, "plan_infrastructure", return_value=self.plans[0]), \
+             patch.object(lab, "preflight", return_value="lh-incus"), \
+             patch.object(lab, "inventory"), patch.object(lab, "tofu"):
+            lab.apply_infrastructure(lab.load_spec(), "lh-incus")
+        self.assertFalse(stale.exists())
+
+    def test_shell_maps_short_node_names(self):
+        for node, expected in (([], "lh-incus-server"), (["worker2"], "lh-incus-worker2"),
+                               (["lh-incus-worker3"], "lh-incus-worker3")):
+            with self.subTest(node=node), \
+                 patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+                 patch.object(lab, "tofu", return_value='{"project":"lh-incus"}'), \
+                 patch.object(lab.os, "execvp") as execute:
+                lab.main(["shell", *node])
+            execute.assert_called_once_with(
+                "incus", ["incus", "shell", "local:" + expected, "--project", "lh-incus"])
+
+    def test_kubeconfig_names_follow_the_project(self):
+        playbook = yaml.safe_load((ROOT / "ansible/site.yml").read_text())
+        task = next(task for play in playbook for task in play.get("tasks", [])
+                    if task["name"] == "Name the cluster, user and context after the project")
+        module = task["ansible.builtin.replace"]
+        k3s = ("apiVersion: v1\nclusters:\n- cluster:\n    server: https://172.28.156.20:6443\n"
+               "  name: default\ncontexts:\n- context:\n    cluster: default\n    user: default\n"
+               "  name: default\ncurrent-context: default\nkind: Config\nusers:\n- name: default\n"
+               "  user:\n    client-certificate-data: ZGVmYXVsdA==\n")
+        replacement = module["replace"].replace("{{ incus_project }}", "lh-incus")
+        renamed = yaml.safe_load(re.sub(module["regexp"], replacement, k3s, flags=re.MULTILINE))
+        self.assertEqual(renamed["current-context"], "lh-incus")
+        self.assertEqual(renamed["contexts"][0], {"context": {"cluster": "lh-incus", "user": "lh-incus"},
+                                                  "name": "lh-incus"})
+        self.assertEqual((renamed["clusters"][0]["name"], renamed["users"][0]["name"]), ("lh-incus", "lh-incus"))
+        self.assertEqual(renamed["users"][0]["user"]["client-certificate-data"], "ZGVmYXVsdA==")
 
     def test_cluster_spec_defaults_overrides_and_validation(self):
         example = yaml.safe_load((ROOT / "cluster.yml.example").read_text())

@@ -2,14 +2,15 @@
 # (ignored) and edit.
 #
 # Launch:   mise run up -- --confirm lh-incus
-# Teardown: mise run down -- --confirm lh-incus
+# Teardown: mise run down            (force, like vagrant destroy -f)
 #
 # Flags override any value for one run without changing this file:
 #   --ubuntu, --image-source, --k3s, --longhorn, --ip-family,
 #   --storage-network / --no-storage-network
 # Changing ubuntu, image_source, ip_family or storage_network, or switching
 # longhorn between a release and master-head, needs a fresh cluster: run down,
-# then up. K3s and Longhorn downgrades are refused.
+# then up. K3s and Longhorn downgrades are refused. Every new cluster starts
+# from blank disks and new local secrets.
 
 # Ubuntu release for every VM. Quote it ("24.04", not 24.04).
 # Values: an Ubuntu release with cloud images, for example "22.04", "24.04",

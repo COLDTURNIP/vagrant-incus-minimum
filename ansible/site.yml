@@ -31,7 +31,7 @@
     - name: Refuse silent token rotation on an existing cluster
       ansible.builtin.assert:
         that: cluster_token_file.stat.exists or not cluster_existing_config.stat.exists
-        fail_msg: Restore the original .state/k3s-token; provisioning does not reset an existing cluster.
+        fail_msg: Restore the original .state/k3s-token, or recreate the cluster with mise run down and up; provisioning does not reset an existing cluster.
     - name: Generate or reuse the cluster token
       ansible.builtin.set_fact:
         cluster_token: >-
@@ -80,6 +80,15 @@
         path: "{{ kubeconfig_path }}"
         regexp: 'server:.*'
         replace: "server: {{ incus_server_url }}"
+        mode: "0600"
+      no_log: true
+    - name: Name the cluster, user and context after the project
+      # K3s names all three "default"; a unique name lets this file be merged
+      # with other clusters' kubeconfigs in one KUBECONFIG list.
+      ansible.builtin.replace:
+        path: "{{ kubeconfig_path }}"
+        regexp: '^(\s*(?:- )?(?:name|cluster|user|current-context): )default$'
+        replace: '\g<1>{{ incus_project }}'
         mode: "0600"
       no_log: true
     - name: Configure the cluster

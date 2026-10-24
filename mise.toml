@@ -81,12 +81,12 @@ description = "Run all local-only validation; never contact Incus or Kubernetes"
 depends = ["validate:ansible"]
 
 [tasks.up]
-description = "Create and provision the cluster described by cluster.yml then verify; --confirm PROJECT required"
+description = "Create and provision the cluster described by cluster.yml from scratch, then verify; --confirm PROJECT required"
 dir = "{{config_root}}"
 run = "python scripts/lab.py up"
 
 [tasks.down]
-description = "DELETE the cluster (same as destroy); --confirm PROJECT required"
+description = "Force-delete the disposable cluster and its local secrets, like vagrant destroy -f"
 dir = "{{config_root}}"
 run = "python scripts/lab.py down"
 
@@ -94,6 +94,12 @@ run = "python scripts/lab.py down"
 description = "Import Canonical's checksum-verified Ubuntu cloud image for image_source: official"
 dir = "{{config_root}}"
 run = "python scripts/lab.py import-image"
+
+[tasks.shell]
+description = "Open a root shell in a VM: mise run shell [-- server|worker<N>]"
+dir = "{{config_root}}"
+raw = true
+run = "python scripts/lab.py shell"
 
 [tasks.init]
 description = "Initialize OpenTofu provider and state metadata; no VMs"
@@ -126,7 +132,7 @@ dir = "{{config_root}}"
 run = "python scripts/lab.py verify"
 
 [tasks.destroy]
-description = "DELETE cluster VMs, data volumes and owned bridges; --confirm PROJECT required"
+description = "Same as down: force-delete VMs, data volumes, bridges and local cluster secrets"
 dir = "{{config_root}}"
 run = "python scripts/lab.py destroy"
 
