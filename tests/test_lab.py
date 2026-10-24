@@ -339,51 +339,109 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(args[-2:], ["--extra-vars", "@" + str(lab.ANSIBLE_SPEC)])
         self.assertEqual(json.loads(lab.ANSIBLE_SPEC.read_text())["k3s_version"], "v1.35.0+k3s1")
 
-    def test_strict_longhorn_health_gate_with_ansible(self):
+    def test_longhorn_node_problems_are_warnings(self):
         playbook = yaml.safe_load((ROOT / "ansible/verify.yml").read_text())
-        gate = next(task for task in playbook[1]["tasks"]
-                    if task["name"] == "Require every Longhorn node and disk condition to be green")
-        node = {"metadata": {"name": "test-worker"}, "status": {
-            "conditions": [{"type": str(i), "status": "True"} for i in range(8)],
-            "diskStatus": {name: {"conditions": [
-                {"type": "Ready", "status": "True"},
-                {"type": "Schedulable", "status": "True"}]} for name in ("v1", "v2")}}}
-        hugepages_off = {"type": "HugePagesAvailable", "status": "False", "reason": "HugePagesNotConfigured"}
-        # (case, hugepages enabled, expected to pass)
-        cases = (("green", False, True),
-                 ("extra-true-disk-condition", False, True),
-                 ("hugepages-disabled", False, True),
-                 ("hugepages-enabled", True, False),
-                 ("smart-unsupported", False, True),
-                 ("node-condition", False, False),
-                 ("disk-ready", False, False))
-        for case, hugepages, expected in cases:
+        names = ("Collect missing Longhorn Node CRs",
+                 "Collect Longhorn node and disk conditions that are not True",
+                 "Warn about Longhorn Node CR status")
+        tasks = [task for task in playbook[1]["tasks"] if task["name"] in names]
+        self.assertEqual(len(tasks), len(names))
+        output = lab.STATE / "node-problems.json"
+        tasks.append({"name": "Write problems", "ansible.builtin.copy": {
+            "content": "{{ verification_longhorn_problems | to_json }}", "dest": str(output), "mode": "0600"}})
+        hosts = lab.STATE / "node-problems-inventory.json"
+        hosts.write_text(json.dumps({"all": {"hosts": {"localhost": {"ansible_connection": "local"}},
+                                             "children": {"workers": {"hosts": {"w1": {}, "w2": {}}}}}}))
+
+        def node(name):
+            return {"metadata": {"name": name}, "status": {
+                "conditions": [{"type": str(i), "status": "True"} for i in range(8)],
+                "diskStatus": {disk: {"conditions": [{"type": "Ready", "status": "True"},
+                                                     {"type": "Schedulable", "status": "True"}]}
+                               for disk in ("v1", "v2")}}}
+
+        hugepages = {"type": "HugePagesAvailable", "status": "False", "reason": "HugePagesNotConfigured",
+                     "message": "HugePages (2Mi) are not configured"}
+        # (case, hugepages enabled, expected problem fragments)
+        cases = (("green", False, []), ("extra-true-disk-condition", False, []),
+                 ("hugepages-disabled", False, []),
+                 ("hugepages-enabled", True, ["w1: node condition HugePagesAvailable is not True - HugePages"]),
+                 ("smart-unsupported", False, []),
+                 ("multipathd", False, ["w1: node condition Multipathd is not True"]),
+                 ("v2-creating", False, ["w1: disk condition Ready is not True - creating"]),
+                 ("missing-v2-disk", False, ["w1: expected 2 disks, found 1",
+                                             "w1: a disk lacks a Ready or Schedulable condition"]),
+                 ("missing-node", False, ["w2 has no Longhorn Node CR"]))
+        for case, enabled, expected in cases:
             with self.subTest(case=case):
-                sample = copy.deepcopy(node)
-                conditions = sample["status"]["conditions"]
-                disks = sample["status"]["diskStatus"]
+                nodes = [node("w1"), node("w2")]
+                status = nodes[0]["status"]
                 if case == "extra-true-disk-condition":
-                    disks["v1"]["conditions"].append({"type": "HealthDataCollected", "status": "True"})
+                    status["diskStatus"]["v1"]["conditions"].append({"type": "HealthDataCollected", "status": "True"})
                 elif case.startswith("hugepages"):
-                    conditions[-1] = hugepages_off
+                    status["conditions"][-1] = hugepages
                 elif case == "smart-unsupported":
-                    for disk in disks.values():
+                    for disk in status["diskStatus"].values():
                         disk["conditions"].append({"type": "HealthDataCollected", "status": "False",
-                                                   "reason": "HealthDataCollectionFailed"})
-                elif case == "node-condition":
-                    conditions[-1] = {"type": "Multipathd", "status": "False", "reason": "MultipathdIsRunning"}
-                elif case == "disk-ready":
-                    disks["v2"]["conditions"][0]["status"] = "False"
-                play = [{"name": "Check strict node health", "hosts": "localhost",
-                         "gather_facts": False, "vars": {"install_longhorn": True,
-                             "incus_enable_v2": True, "v2_hugepages": hugepages,
-                             "verification_longhorn_nodes": {"resources": [sample]}},
-                         "tasks": [gate]}]
-                path = lab.STATE / "node-health-test.yml"
+                                                   "message": "exit status 4"})
+                elif case == "multipathd":
+                    status["conditions"][-1] = {"type": "Multipathd", "status": "False"}
+                elif case == "v2-creating":
+                    status["diskStatus"]["v2"]["conditions"][0].update(status="False", message="creating")
+                elif case == "missing-v2-disk":
+                    del status["diskStatus"]["v2"]
+                elif case == "missing-node":
+                    nodes.pop()
+                play = [{"name": "Check Longhorn Node CR warnings", "hosts": "localhost", "gather_facts": False,
+                         "vars": {"install_longhorn": True, "incus_enable_v2": True, "v2_hugepages": enabled,
+                                  "verification_longhorn_nodes": {"resources": nodes}},
+                         "tasks": tasks}]
+                path = lab.STATE / "node-problems-test.yml"
                 path.write_text(yaml.safe_dump(play), encoding="ascii")
-                result = subprocess.run(["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+                result = subprocess.run(["ansible-playbook", "-i", str(hosts), str(path)],
                                         cwd=ROOT, capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, expected, result.stdout)
+                self.assertEqual(result.returncode, 0, "warnings must not fail verify: " + result.stdout[-2000:])
+                problems = json.loads(output.read_text())
+                self.assertEqual(len(problems), len(expected), problems)
+                for fragment, problem in zip(expected, problems):
+                    self.assertIn(fragment, problem)
+                self.assertEqual("WARNING: Longhorn Node CR status" in result.stdout, bool(expected))
+
+    def test_disk_readiness_waits_with_ansible(self):
+        role = yaml.safe_load((ROOT / "ansible/roles/longhorn/tasks/main.yml").read_text())
+        verify = yaml.safe_load((ROOT / "ansible/verify.yml").read_text())
+        waits = {
+            "longhorn_nodes": next(t for t in role if t["name"].startswith("Wait for every Longhorn disk"))["until"],
+            "verification_longhorn_nodes": next(t for t in verify[1]["tasks"]
+                                                if t["name"].startswith("Inspect every Longhorn Node CR"))["until"],
+        }
+
+        def disk(ready):
+            return {"conditions": [{"type": "Ready", "status": "True" if ready else "False"},
+                                   {"type": "Schedulable", "status": "True" if ready else "False"},
+                                   {"type": "HealthDataCollected", "status": "False"}]}
+
+        def node(v2_ready=True, status=True):
+            return {"status": {"diskStatus": {"v1": disk(True), "v2": disk(v2_ready)}}} if status else {}
+
+        cases = (("ready", [node(), node()], True), ("v2-creating", [node(), node(v2_ready=False)], False),
+                 ("no-status-yet", [node(), node(status=False)], False), ("worker-missing", [node()], False))
+        for register, expression in waits.items():
+            for case, resources, expected in cases:
+                with self.subTest(task=register, case=case):
+                    play = [{"name": "Check disk readiness", "hosts": "localhost", "gather_facts": False,
+                             "vars": {register: {"resources": resources}, "incus_enable_v2": True,
+                                      "longhorn_ready_disk_conditions": 8},
+                             "tasks": [{"name": "Evaluate", "ansible.builtin.assert": {"that": expression}}]}]
+                    path = lab.STATE / "disk-ready-test.yml"
+                    path.write_text(yaml.safe_dump(play), encoding="ascii")
+                    hosts = lab.STATE / "disk-ready-inventory.json"
+                    hosts.write_text(json.dumps({"all": {
+                        "hosts": {"localhost": {"ansible_connection": "local"}},
+                        "children": {"workers": {"hosts": {"w1": {}, "w2": {}}}}}}))
+                    result = subprocess.run(["ansible-playbook", "-i", str(hosts), str(path)],
+                                            cwd=ROOT, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, expected, result.stdout[-2000:])
 
     def test_master_head_manifest_customization_with_ansible(self):
         tasks = yaml.safe_load((ROOT / "ansible/roles/longhorn/tasks/manifest.yml").read_text())

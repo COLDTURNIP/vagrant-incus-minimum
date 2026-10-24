@@ -1,10 +1,11 @@
 # Live acceptance checks
 
 The [initial live run](live-validation.md) passed storage networking and V1/V2
-I/O but is not complete acceptance. `mise run verify` requires every Longhorn
-node and disk condition to be True except two documented false negatives:
-HugePagesAvailable while V2 hugepages are disabled, and HealthDataCollected
-because QEMU virtual disks have no SMART support. Do not patch status fields.
+I/O but is not complete acceptance. `mise run verify` reports Longhorn Node CR
+problems as warnings, not failures, and leaves out two documented false
+negatives: HugePagesAvailable while V2 hugepages are disabled, and
+HealthDataCollected because QEMU virtual disks have no SMART support. Read its
+warnings as part of each acceptance check.
 
 Status: partially executed; full matrix pending. These checks mutate only an approved disposable Incus
 cluster and its explicitly named test volumes. They do not authorize changing

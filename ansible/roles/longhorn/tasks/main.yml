@@ -51,3 +51,29 @@
         namespace: longhorn-system
       value: "{{ item.value | string }}"
   loop: "{{ longhorn_settings | dict2items }}"
+
+- name: Wait for every Longhorn disk to be ready and schedulable
+  # V2 block disks stay in "creating" until the SPDK instance manager has set up
+  # the AIO bdev, which can finish after the manager and CSI pods are ready. A
+  # disk that never becomes ready is a Longhorn finding, so warn and continue.
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig_path }}"
+    api_version: longhorn.io/v1beta2
+    kind: Node
+    namespace: longhorn-system
+  register: longhorn_nodes
+  until: >-
+    longhorn_nodes.resources | default([]) | map(attribute='status.diskStatus') | map('default', {}, true)
+    | map('dict2items') | flatten | map(attribute='value.conditions') | map('default', [], true) | flatten
+    | selectattr('type', 'in', ['Ready', 'Schedulable']) | selectattr('status', 'equalto', 'True')
+    | list | length == longhorn_ready_disk_conditions | int
+  retries: 30
+  delay: 10
+  ignore_errors: true
+
+- name: Warn about Longhorn disks that are not ready
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: not every Longhorn disk became Ready and Schedulable after 5 minutes; provisioning
+      continues. Inspect kubectl -n longhorn-system get nodes.longhorn.io -o yaml.
+  when: longhorn_nodes is failed

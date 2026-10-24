@@ -2,6 +2,8 @@
 longhorn_helm_install: "{{ longhorn_version != 'master-head' }}"
 longhorn_manifest_url: https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
 longhorn_replica_count: "{{ [groups['workers'] | length, 3] | min }}"
+# Ready and Schedulable on every V1 (and V2) disk of every worker.
+longhorn_ready_disk_conditions: "{{ groups['workers'] | length * (2 if incus_enable_v2 else 1) * 2 }}"
 # Applied before first start (manifest default settings) and reconciled afterward.
 longhorn_settings:
   create-default-disk-labeled-nodes: "true"

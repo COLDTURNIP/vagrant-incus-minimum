@@ -65,11 +65,12 @@ Non-green conditions, both false negatives in this lab and skipped by verify:
   and `node-disk-health-monitoring` defaults to true. QEMU virtual disks
   report `smart_support.available: false`, so collection always fails.
 
-`mise run verify` skips exactly these two condition types, with the reasons
-commented in `ansible/verify.yml`. HugePagesAvailable is skipped only while
-`v2_hugepages` is false. Every other node condition, and disk Ready and
-Schedulable, must be True. After this change `mise run verify` passes on the
-master-head cluster (`master-head/verify-suppressed.log`).
+`mise run verify` leaves out exactly these two condition types, with the reasons
+commented in `ansible/verify.yml`. HugePagesAvailable is left out only while
+`v2_hugepages` is false. At the time of this run, every other node condition
+and disk Ready and Schedulable had to be True, and `mise run verify` passed on
+the master-head cluster (`master-head/verify-suppressed.log`). Longhorn Node CR
+problems are now warnings; see "Disk readiness race" below.
 
 ## cluster.yml workflow check
 
@@ -95,6 +96,22 @@ provisioned it, and passed verify in about 6 minutes. Plain `kubectl` used the
 `lh-incus` context, raw `incus list local:` listed the lab VMs without
 `--project`, and `mise run shell -- worker2` reached `lh-incus-worker2`.
 Logs are in `.state/live/fresh/`.
+
+## Disk readiness race
+
+A user-run `mise run up --confirm lh-incus` on a fresh cluster failed in
+verify. Provisioning returned once the Longhorn manager and CSI pods were
+ready, but the three V2 block disks were still `creating` while the SPDK
+instance managers set up their AIO bdevs. Verify started at 07:39:16Z; the disks
+became Ready and Schedulable at 07:39:30Z. Provisioning now waits up to 5
+minutes for every Longhorn disk, and verify polls for disk readiness before
+checking. A repeated `mise run down` and fresh `up` needed one retry of the
+provisioning wait and then passed.
+
+Longhorn Node CR status then changed from failing verify to warnings, since
+this lab exists to test Longhorn and a non-green node or disk can be the bug
+under investigation. Infrastructure, Kubernetes, and configuration checks still
+fail verify. Logs are in `.state/live/race/`.
 
 ## Recovery and provisioning corrections
 
@@ -134,7 +151,8 @@ setting. The functional V2 test therefore passes while the condition stays
 False.
 
 Hugepages were not allocated and status was not patched. `mise run verify`
-skips this condition while `v2_hugepages` is false and enforces it otherwise.
+leaves this condition out while `v2_hugepages` is false and reports it as a
+warning otherwise.
 
 ## Access and private evidence
 

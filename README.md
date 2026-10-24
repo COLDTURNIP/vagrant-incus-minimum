@@ -193,10 +193,18 @@ rejects subnet collisions and existing project/network name collisions.
 refuses any deletion/replacement, including worker removal or a network-layout
 switch. Do not use direct `tofu apply` to bypass the helper's checks.
 
-`verify` requires every Longhorn node and disk condition to be True, except two
-false negatives in these VMs: `HugePagesAvailable` while V2 hugepages are
-disabled, and `HealthDataCollected` because virtual disks have no SMART
-support. The reasons are commented in `ansible/verify.yml`.
+`verify` fails on infrastructure, Kubernetes, and configuration problems: K3s
+services, mounts, Kubernetes node readiness, the Longhorn manager, and the
+storage-network and hugepage settings. Longhorn Node CR status only produces
+warnings, because a non-green node or disk can be exactly the Longhorn bug under
+test. It waits up to 5 minutes for disks to become ready, then prints a
+`WARNING` listing every node or disk condition that is not True, every
+missing Node CR, and every missing disk. Two known false negatives in these VMs
+are not reported: `HugePagesAvailable` while V2 hugepages are disabled, and
+`HealthDataCollected` because virtual disks have no SMART support. The
+reasons are commented in `ansible/verify.yml`. Provisioning also waits up to 5
+minutes for every Longhorn disk to become ready and warns, rather than fails,
+if one does not.
 
 ### Access
 

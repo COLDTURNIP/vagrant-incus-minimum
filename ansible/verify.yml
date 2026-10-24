@@ -82,54 +82,88 @@
         (verification_hugepage_setting.resources[0].value | from_json).v2 != 'false'
       when: install_longhorn | bool and incus_enable_v2 | bool and not v2_hugepages | bool
 
-    - name: Inspect every Longhorn Node CR
+    # Longhorn Node CR status only produces warnings: this lab exists to test
+    # Longhorn, so a non-green node or disk can be the bug under investigation.
+    # Infrastructure, Kubernetes, and configuration checks above still fail.
+    - name: Inspect every Longhorn Node CR once its disks are ready
       kubernetes.core.k8s_info:
         kubeconfig: "{{ kubeconfig_path }}"
         api_version: longhorn.io/v1beta2
         kind: Node
         namespace: longhorn-system
       register: verification_longhorn_nodes
+      # Give V2 disks time to leave "creating" right after provisioning. If
+      # they never do, the problems are reported as warnings below.
+      until: >-
+        verification_longhorn_nodes.resources | default([]) | map(attribute='status.diskStatus')
+        | map('default', {}, true) | map('dict2items') | flatten | map(attribute='value.conditions')
+        | map('default', [], true) | flatten | selectattr('type', 'in', ['Ready', 'Schedulable'])
+        | selectattr('status', 'equalto', 'True') | list | length
+        == groups['workers'] | length * (2 if incus_enable_v2 else 1) * 2
+      retries: 30
+      delay: 10
+      ignore_errors: true
       when: install_longhorn | bool
 
-    - name: Require the expected Longhorn workers
-      ansible.builtin.assert:
-        that:
-          - verification_longhorn_nodes.resources | map(attribute='metadata.name') | sort == groups['workers'] | sort
+    - name: Collect missing Longhorn Node CRs
+      ansible.builtin.set_fact:
+        verification_longhorn_problems: >-
+          {{ groups['workers'] | difference(verification_longhorn_nodes.resources | default([])
+             | map(attribute='metadata.name') | list) | map('regex_replace', '$', ' has no Longhorn Node CR')
+             | list }}
       when: install_longhorn | bool
 
-    - name: Require every Longhorn node and disk condition to be green
-      ansible.builtin.assert:
-        that:
-          - item.status.conditions | default([]) | length >= (8 if incus_enable_v2 else 7)
-          - verification_node_failures | length == 0
-          - item.status.diskStatus | default({}) | length == (2 if incus_enable_v2 else 1)
-          - verification_disk_conditions | selectattr('type', 'in', ['Ready', 'Schedulable']) | list | length == (4 if incus_enable_v2 else 2)
-          - verification_disk_failures | length == 0
-        fail_msg: >-
-          Longhorn Node CR {{ item.metadata.name }} is not all-green:
-          {{ verification_node_failures }}; disks: {{ verification_disk_failures }}
+    - name: Collect Longhorn node and disk conditions that are not True
+      ansible.builtin.set_fact:
+        verification_longhorn_problems: "{{ verification_longhorn_problems + verification_node_problems }}"
       vars:
         # HugePagesAvailable: when V2 hugepages are disabled, SPDK runs with
         # --no-huge and needs none. Longhorn (v1.13.0 and master-head) still
         # tests node hugepage capacity whenever V2 is enabled, ignoring the
-        # data-engine-hugepage-enabled setting, so the condition is a false
-        # negative here. It is still enforced when v2_hugepages is true.
+        # data-engine-hugepage-enabled setting, so the condition is a known
+        # false negative here. It is reported when v2_hugepages is true.
         verification_ignored_node_conditions: "{{ [] if v2_hugepages | bool else ['HugePagesAvailable'] }}"
         # HealthDataCollected: disk health monitoring (newer Longhorn) reads
         # SMART data. QEMU virtual disks report no SMART support, so smartctl
-        # exits 4 and collection always fails in these VMs. Disk Ready and
-        # Schedulable are still required.
+        # exits 4 and collection always fails in these VMs.
         verification_ignored_disk_conditions: [HealthDataCollected]
+        verification_prefix: "{{ item.metadata.name }}: "
         verification_node_failures: >-
-          {{ item.status.conditions | default([]) | rejectattr('status', 'equalto', 'True')
+          {{ item.status.conditions | default([], true) | rejectattr('status', 'equalto', 'True')
              | rejectattr('type', 'in', verification_ignored_node_conditions) | list }}
-        verification_disk_conditions: >-
-          {{ item.status.diskStatus | default({}) | dict2items |
-             map(attribute='value.conditions') | flatten }}
+        verification_disks: "{{ item.status.diskStatus | default({}, true) | dict2items }}"
         verification_disk_failures: >-
-          {{ verification_disk_conditions | rejectattr('status', 'equalto', 'True')
+          {{ verification_disks | map(attribute='value.conditions') | map('default', [], true) | flatten
+             | rejectattr('status', 'equalto', 'True')
              | rejectattr('type', 'in', verification_ignored_disk_conditions) | list }}
+        verification_ready_disk_conditions: >-
+          {{ verification_disks | map(attribute='value.conditions') | map('default', [], true) | flatten
+             | selectattr('type', 'in', ['Ready', 'Schedulable']) | list | length }}
+        verification_expected_disks: "{{ 2 if incus_enable_v2 else 1 }}"
+        verification_node_problems: >-
+          {{ (verification_node_failures | map(attribute='type')
+              | map('regex_replace', '^', verification_prefix ~ 'node condition ') | map('regex_replace', '$', ' is not True')
+              | zip(verification_node_failures | map(attribute='message', default='')) | map('join', ' - ') | list)
+             + (verification_disk_failures | map(attribute='type')
+              | map('regex_replace', '^', verification_prefix ~ 'disk condition ') | map('regex_replace', '$', ' is not True')
+              | zip(verification_disk_failures | map(attribute='message', default='')) | map('join', ' - ') | list)
+             + ([verification_prefix ~ 'expected ' ~ verification_expected_disks ~ ' disks, found '
+                 ~ verification_disks | length] if verification_disks | length != verification_expected_disks | int
+                else [])
+             + ([verification_prefix ~ 'a disk lacks a Ready or Schedulable condition']
+                if verification_ready_disk_conditions | int != verification_expected_disks | int * 2 else []) }}
       loop: "{{ verification_longhorn_nodes.resources | default([]) }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       when: install_longhorn | bool
+
+    - name: Warn about Longhorn Node CR status
+      ansible.builtin.debug:
+        msg: "{{ ['WARNING: Longhorn Node CR status needs attention (not a verify failure):']
+                 + verification_longhorn_problems }}"
+      when: install_longhorn | bool and verification_longhorn_problems | length > 0
+
+    - name: Report green Longhorn Node CR status
+      ansible.builtin.debug:
+        msg: Every Longhorn node and disk condition is True, apart from the documented false negatives.
+      when: install_longhorn | bool and verification_longhorn_problems | length == 0
