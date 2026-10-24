@@ -46,8 +46,10 @@ class OfflineTests(unittest.TestCase):
         scratch = Path(tempfile.mkdtemp(dir=lab.STATE))
         self.addCleanup(shutil.rmtree, scratch)
         self.scratch = scratch
+        # Fresh-cluster and teardown paths delete CLUSTER_FILES, so point them at scratch.
         patcher = patch.multiple(lab, SPEC_FILE=scratch / "cluster.yml", TF_SPEC=scratch / "tf.json",
-                                 ANSIBLE_SPEC=scratch / "vars.json", APPLIED_SPEC=scratch / "applied.json")
+                                 ANSIBLE_SPEC=scratch / "vars.json", APPLIED_SPEC=scratch / "applied.json",
+                                 CLUSTER_FILES=(scratch / "k3s-token", scratch / "k3s.config"))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -184,6 +186,11 @@ class OfflineTests(unittest.TestCase):
         volume["change"]["actions"] = ["no-op"]
         with self.assertRaisesRegex(ValueError, 'incus_instance.node\\["worker1"\\] would reuse'):
             lab.require_fresh_disks(plan)
+
+    def test_tests_never_touch_real_cluster_files(self):
+        # A live cluster's token, kubeconfig, and credentials must survive mise run validate.
+        for path in (*lab.CLUSTER_FILES, lab.APPLIED_SPEC, lab.TF_SPEC, lab.ANSIBLE_SPEC, lab.SPEC_FILE):
+            self.assertTrue(path.is_relative_to(self.scratch), path)
 
     def test_fresh_cluster_creation_clears_old_cluster_files(self):
         stale = self.scratch / "k3s-token"
