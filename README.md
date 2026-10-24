@@ -1,9 +1,13 @@
 # Incus Longhorn test environment
 
-An additive alternative to an existing Vagrant/libvirt cluster. OpenTofu owns
-Incus infrastructure; Ansible owns guest software and Kubernetes services.
-It has been live-validated on one host; see [live validation](docs/live-validation.md).
-Do not retire the existing environment until the live acceptance checks pass.
+A disposable Longhorn test cluster on Incus VMs. It replaces the deprecated
+Vagrant/libvirt setup in
+[COLDTURNIP/vagrant-longhorn-minimum](https://github.com/COLDTURNIP/vagrant-longhorn-minimum).
+OpenTofu owns Incus infrastructure; Ansible owns guest software and Kubernetes
+services. It has been live-validated on one host; see
+[live validation](docs/live-validation.md). The remaining
+[acceptance checks](docs/acceptance.md), such as backup restore and reboot
+recovery, are still open.
 
 ## Ownership and layout
 
