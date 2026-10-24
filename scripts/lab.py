@@ -41,15 +41,128 @@ CLUSTER_FILES = (
     STATE / "backup.key", STATE / "backup.crt", ROOT / "shared" / "k3s.config",
     ROOT / "shared" / "longhorn-values.yml", ROOT / "shared" / "longhorn-manifest.yml",
 )
+# Quiet mode (--quiet, or automatic off a terminal): full command output goes to a
+# per-run log; the terminal gets step lines, a summary, or the failure excerpt.
+# Keeps an agent's context small.
+LOGS = STATE / "logs"
+LOG = None
+KEPT_LOGS = 20
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Lines worth showing from a failed step: Ansible task failures, OpenTofu errors.
+FAILURE_LINE = re.compile(r'^(fatal|failed):|FAILED!|^\s*"(msg|stderr|stdout)":|Error:|^ERROR')
 
 
 def run(args, *, capture=False):
-    print("+ " + " ".join(map(str, args)), file=sys.stderr)
-    result = subprocess.run(
-        list(map(str, args)), cwd=ROOT, check=True, text=True,
-        stdout=subprocess.PIPE if capture else None,
-    )
+    args = list(map(str, args))
+    if LOG is None:
+        print("+ " + " ".join(args), file=sys.stderr)
+        result = subprocess.run(args, cwd=ROOT, check=True, text=True,
+                                stdout=subprocess.PIPE if capture else None)
+        return result.stdout if capture else ""
+    command = " ".join(args).replace(str(ROOT) + "/", "")
+    if not capture:
+        print("+ " + command, file=sys.stderr, flush=True)
+    with LOG.open("a", encoding="utf-8") as log:
+        log.write("\n+ " + command + "\n")
+        log.flush()
+        start = log.tell()
+        began = time.monotonic()
+        result = subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE if capture else log,
+                                stderr=log)
+    if result.returncode:
+        report_failure(start)
+        raise subprocess.CalledProcessError(result.returncode, command if len(command) < 80 else args[0])
+    if not capture:
+        print(f"  ok in {elapsed(began)}", file=sys.stderr)
+        report_notices(start)
     return result.stdout if capture else ""
+
+
+def elapsed(began):
+    minutes, seconds = divmod(round(time.monotonic() - began), 60)
+    return f"{minutes}m{seconds:02d}s" if minutes else f"{seconds}s"
+
+
+def log_lines(start):
+    with LOG.open(encoding="utf-8", errors="replace") as log:
+        log.seek(start)
+        return [ANSI.sub("", line.rstrip()) for line in log]
+
+
+def clip(line, width=300):
+    return line if len(line) <= width else line[:width] + " ..."
+
+
+def condense(line):
+    """Shorten an Ansible one-line failure result to the fields that explain it."""
+    prefix, arrow, payload = line.partition(" => {")
+    try:
+        result = json.loads("{" + payload) if arrow else None
+    except json.JSONDecodeError:
+        result = None
+    if not isinstance(result, dict):
+        return clip(line)
+    fields = [f"{key}={str(result[key]).strip()[-200:]!r}"
+              for key in ("msg", "rc", "stderr", "stdout") if str(result.get(key, "")).strip()]
+    return clip(prefix + " " + "; ".join(fields), 500)
+
+
+def report_failure(start, important=15, tail=10):
+    lines = log_lines(start)
+    picked, task = [], None
+    for line in lines:
+        if line.startswith("TASK ["):
+            task = line.rstrip(" *")
+        elif FAILURE_LINE.search(line):
+            if task:
+                picked.append(task)
+                task = None
+            picked.append(line)
+    picked = picked[-important:]
+    if picked:
+        print("  Errors:", file=sys.stderr)
+        print("\n".join("    " + condense(line) for line in picked), file=sys.stderr)
+    # The tail adds context such as the Ansible recap; skip lines shown above.
+    rest = [line for line in lines if line.strip() and not FAILURE_LINE.search(line)][-tail:]
+    print(f"  Last {len(rest)} other lines:", file=sys.stderr)
+    print("\n".join("    " + clip(line) for line in rest), file=sys.stderr)
+
+
+def report_notices(start):
+    """Repeat what a reader of a successful step needs: lab warnings and the Ansible recap."""
+    lines = log_lines(start)
+    notices, in_message = [], False
+    for line in lines:
+        text = line.strip().removeprefix('"msg": ').strip('",')
+        if "WARNING: " in line or "Every Longhorn node and disk condition is True" in line:
+            notices.append(text)
+        elif in_message:
+            notices.append("  " + text)
+        else:
+            continue
+        # A list-valued debug message continues while its items end with a comma.
+        in_message = line.endswith('",')
+    recaps = [i for i, line in enumerate(lines) if line.startswith("PLAY RECAP")]
+    if recaps:
+        hosts = [line.split() for line in lines[recaps[-1] + 1:] if " : ok=" in line]
+        counts = [dict(field.split("=") for field in host[2:]) for host in hosts]
+        if all(count["failed"] == count["unreachable"] == "0" for count in counts):
+            changed = sum(int(count["changed"]) for count in counts)
+            notices.append(f"Ansible: {len(hosts)} hosts, {changed} changed, 0 failed, 0 unreachable")
+        else:
+            notices += [" ".join(host[:6]) for host in hosts]
+    for line in notices:
+        print("  " + clip(line), file=sys.stderr)
+
+
+def start_log(command):
+    global LOG
+    LOGS.mkdir(parents=True, exist_ok=True)
+    for old in sorted(LOGS.glob("*.log"))[:-KEPT_LOGS + 1]:
+        old.unlink()
+    LOG = LOGS / (time.strftime("%Y%m%d-%H%M%S") + "-" + command + ".log")
+    LOG.touch(mode=0o600)
+    print(f"Logging command output to {LOG.relative_to(ROOT)}; --verbose streams it", file=sys.stderr)
 
 
 def tofu(*args, capture=False):
@@ -446,12 +559,24 @@ def main(argv=None):
     overrides.add_argument("--longhorn", help="vX.Y.Z (Helm) or master-head (manifest)")
     overrides.add_argument("--ip-family", choices=list(IP_FAMILIES))
     overrides.add_argument("--storage-network", action=argparse.BooleanOptionalAction, default=None)
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--quiet", action="store_true",
+                        help="send command output to .state/logs/ and print only steps, a summary, or the "
+                             "failure excerpt; the default unless stdout and stderr are terminals")
+    output.add_argument("--verbose", action="store_true",
+                        help="stream all command output, even when not on a terminal (for example | tee)")
     args = parser.parse_args(argv)
     if args.dry_run and args.command not in ("plan", "apply", "up", "down", "destroy"):
         raise ValueError(f"--dry-run is not supported by {args.command}")
     for program in ("tofu", "incus", "ip", "ansible-playbook"):
         if not shutil.which(program):
             raise ValueError(f"Missing required command: {program}; run through mise")
+    if args.quiet and args.command == "shell":
+        raise ValueError("--quiet is not supported by shell")
+    # Agents and scripts read output through pipes; people at a terminal see it stream.
+    terminal = sys.stdout.isatty() and sys.stderr.isatty()
+    if args.command != "shell" and (args.quiet or not (args.verbose or terminal)):
+        start_log(args.command)
     if args.command in ("destroy", "down"):
         # Teardown uses state only, so an invalid cluster.yml cannot block it.
         destroy(args.dry_run)
@@ -490,6 +615,7 @@ def main(argv=None):
         provision(spec)
         record_applied(spec, "k3s", "longhorn")
         provision(spec, "verify.yml")
+        print(f"Cluster ready: KUBECONFIG={ROOT / 'shared' / 'k3s.config'} (context lh-incus)", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -498,3 +624,6 @@ if __name__ == "__main__":
     except (ValueError, KeyError, subprocess.CalledProcessError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        if LOG is not None and LOG.stat().st_size:
+            print(f"Full log: {LOG}", file=sys.stderr)

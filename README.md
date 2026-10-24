@@ -194,6 +194,22 @@ kubectl get nodes -o wide             # with KUBECONFIG set as below
 per-run flags. `--dry-run` works with `up`, `apply`, `down`, and `destroy`;
 `plan` is the same as `apply --dry-run`.
 
+A fresh `up` streams several thousand lines of OpenTofu and Ansible output.
+That happens only when stdout and stderr are both terminals. Otherwise, as when
+an AI agent or a script runs the lab, every command except `shell` switches to
+quiet mode. Quiet mode writes that output to
+`.state/logs/<time>-<command>.log` instead, keeping the newest 20 logs. The
+terminal then shows one line per step with its duration. A successful step
+adds a one-line Ansible recap and any `WARNING` from provisioning or verify.
+A failed step adds the failed task, each host's failure reduced to `msg`,
+`rc`, `stderr`, and `stdout`, and the last other log lines, such as the
+recap. Every run ends with the log path. `--quiet` forces quiet mode at a
+terminal. `--verbose` streams everything even through a pipe:
+
+```sh
+mise run up --verbose 2>&1 | tee up.log
+```
+
 `apply` (and `up`) builds a fresh plan and runs every check before changing
 anything. Preflight rejects subnet collisions, existing project/network name
 collisions, and the `default` Incus project. Any deletion or replacement is

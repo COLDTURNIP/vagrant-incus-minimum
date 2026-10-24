@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -49,9 +50,12 @@ class OfflineTests(unittest.TestCase):
         # Fresh-cluster and teardown paths delete CLUSTER_FILES, so point them at scratch.
         patcher = patch.multiple(lab, SPEC_FILE=scratch / "cluster.yml", TF_SPEC=scratch / "tf.json",
                                  ANSIBLE_SPEC=scratch / "vars.json", APPLIED_SPEC=scratch / "applied.json",
-                                 CLUSTER_FILES=(scratch / "k3s-token", scratch / "k3s.config"))
+                                 CLUSTER_FILES=(scratch / "k3s-token", scratch / "k3s.config"),
+                                 LOGS=scratch / "logs")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # main() starts a quiet-mode log whenever output is not a terminal, as under unittest.
+        self.addCleanup(setattr, lab, "LOG", None)
 
     def context(self, plan, hostname, target="garage"):
         inventory = plan["planned_values"]["outputs"]["inventory"]["value"]["all"]
@@ -210,7 +214,7 @@ class OfflineTests(unittest.TestCase):
 
     def test_tests_never_touch_real_cluster_files(self):
         # A live cluster's token, kubeconfig, and credentials must survive mise run validate.
-        for path in (*lab.CLUSTER_FILES, lab.APPLIED_SPEC, lab.TF_SPEC, lab.ANSIBLE_SPEC, lab.SPEC_FILE):
+        for path in (*lab.CLUSTER_FILES, lab.APPLIED_SPEC, lab.TF_SPEC, lab.ANSIBLE_SPEC, lab.SPEC_FILE, lab.LOGS):
             self.assertTrue(path.is_relative_to(self.scratch), path)
 
     def test_fresh_cluster_creation_clears_old_cluster_files(self):
@@ -289,6 +293,66 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(json.loads(lab.ANSIBLE_SPEC.read_text()),
                          {"k3s_version": lab.load_spec()["k3s"], "longhorn_version": "master-head",
                           "longhorn_image_overrides": {}, "longhorn_image_archives": []})
+
+    def test_quiet_mode_is_automatic_off_a_terminal(self):
+        for terminal, argv, quiet in ((True, ["inventory"], False), (False, ["inventory"], True),
+                                      (False, ["inventory", "--verbose"], False),
+                                      (True, ["inventory", "--quiet"], True), (False, ["shell"], False)):
+            stderr = io.StringIO()
+            stderr.isatty = lambda terminal=terminal: terminal
+            with self.subTest(terminal=terminal, argv=argv), \
+                    patch("sys.stdout.isatty", return_value=terminal), patch("sys.stderr", new=stderr), \
+                    patch.object(lab, "inventory"), patch.object(lab, "project_name", return_value="lh-incus"), \
+                    patch("os.execvp"):
+                lab.LOG = None
+                lab.main(argv)
+                self.assertEqual(lab.LOG is not None, quiet)
+        with self.assertRaises(SystemExit), patch("sys.stderr", new=io.StringIO()):
+            lab.main(["inventory", "--quiet", "--verbose"])
+        with self.assertRaisesRegex(ValueError, "--quiet is not supported by shell"):
+            lab.main(["shell", "--quiet"])
+
+    def test_quiet_mode_logs_output_and_reports_summary_or_failure(self):
+        logs = self.scratch / "logs"
+        self.addCleanup(setattr, lab, "LOG", None)
+        with patch.object(lab, "LOGS", logs), patch.object(lab, "KEPT_LOGS", 3):
+            logs.mkdir()
+            for index in range(4):
+                (logs / f"2000010{index}-000000-up.log").write_text("old")
+            with patch("sys.stderr", new=io.StringIO()):
+                lab.start_log("up")
+            self.assertEqual(len(list(logs.glob("*.log"))), 3)
+            self.assertTrue(lab.LOG.is_relative_to(logs))
+            success = "\n".join(["noise"] * 500 + [
+                'ok: [localhost] => {', '    "msg": [',
+                '        "WARNING: Longhorn Node CR status needs attention (not a verify failure):",',
+                '        "lh-incus-worker1: node condition X is not True"', '    ]', '}',
+                "PLAY RECAP ****", "lh-incus-server : ok=4 changed=0 unreachable=0 failed=0 skipped=0 rescued=0"])
+            (self.scratch / "success.txt").write_text(success)
+            with patch("sys.stderr", new=io.StringIO()) as stderr:
+                lab.run(["cat", self.scratch / "success.txt"])
+            self.assertEqual(stderr.getvalue().splitlines()[2:], [
+                "  WARNING: Longhorn Node CR status needs attention (not a verify failure):",
+                "    lh-incus-worker1: node condition X is not True",
+                "  Ansible: 1 hosts, 0 changed, 0 failed, 0 unreachable"])
+            (self.scratch / "failure.py").write_text(
+                "import sys\nprint('early-' * 3)\nprint('x\\n' * 100)\n"
+                "print('fatal: [lh-incus-server]: FAILED! => ' + 'y' * 1000)\nprint('tail-line')\nsys.exit(2)\n")
+            with patch("sys.stderr", new=io.StringIO()) as stderr, \
+                    self.assertRaises(subprocess.CalledProcessError):
+                lab.run(["python", self.scratch / "failure.py"])
+            output = stderr.getvalue()
+            self.assertIn("fatal: [lh-incus-server]: FAILED! => yyy", output)
+            self.assertIn("    tail-line", output)
+            self.assertNotIn("early-", output)
+            self.assertLess(max(map(len, output.splitlines())), 320)
+            self.assertIn("early-early-early-", lab.LOG.read_text())
+            self.assertEqual(lab.run(["python", "-c", "print('captured')"], capture=True), "captured\n")
+        failed = {"changed": False, "cmd": ["test"], "delta": "0:00:00.1", "msg": "non-zero return code",
+                  "rc": 1, "stderr": "boom", "stdout": "", "start": "x" * 400}
+        self.assertEqual(lab.condense("fatal: [w1]: FAILED! => " + json.dumps(failed)),
+                         "fatal: [w1]: FAILED! msg='non-zero return code'; rc='1'; stderr='boom'")
+        self.assertEqual(lab.condense("fatal: [w1]: FAILED! => {not json"), "fatal: [w1]: FAILED! => {not json")
 
     def test_custom_image_spec_validation_and_mapping(self):
         archive = self.scratch / "manager.tar"
