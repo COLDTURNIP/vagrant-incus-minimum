@@ -328,9 +328,18 @@ def plan_infrastructure(*, destroy=False, var_file=None):
     return json.loads(tofu("show", "-json", str(PLAN), capture=True))
 
 
-def require_confirmation(actual, supplied):
-    if actual == "default" or supplied != actual:
-        raise ValueError(f"Explicit confirmation required: --confirm {actual}")
+def refuse_default_project(project):
+    if project == "default":
+        raise ValueError("Refusing to manage the default Incus project; use a dedicated project")
+
+
+def summarize_plan(plan):
+    counts = {}
+    for change in plan.get("resource_changes", []):
+        action = "/".join(change["change"]["actions"])
+        if action != "no-op":
+            counts[action] = counts.get(action, 0) + 1
+    return ", ".join(f"{count} to {action}" for action, count in sorted(counts.items())) or "no changes"
 
 
 def provision(spec, playbook="site.yml"):
@@ -344,13 +353,17 @@ def provision(spec, playbook="site.yml"):
     run(args)
 
 
-def apply_infrastructure(spec, confirm):
+def apply_infrastructure(spec, dry_run=False):
+    """Plan, run every guard, then apply unless dry_run. Returns True when applied."""
     refuse_recreation(spec, applied_spec())
     plan = plan_infrastructure(var_file=write_tofu_spec(spec))
-    project = preflight(plan)
+    refuse_default_project(preflight(plan))
     refuse_deletions(plan)
     require_fresh_disks(plan)
-    require_confirmation(project, confirm)
+    if dry_run:
+        print("Dry run: all checks passed; infrastructure would get " + summarize_plan(plan) + ".",
+              file=sys.stderr)
+        return False
     if any(change["type"] == "incus_project" and change["change"]["actions"] == ["create"]
            for change in plan.get("resource_changes", [])):
         # A new project means a new cluster: drop anything left from an older one.
@@ -358,25 +371,36 @@ def apply_infrastructure(spec, confirm):
     tofu("apply", "-input=false", str(PLAN))
     record_applied(spec, *RECREATE_KEYS)
     inventory()
+    return True
 
 
 def project_name():
     return json.loads(tofu("output", "-json", "topology", capture=True))["project"]
 
 
-def destroy():
+def destroy(dry_run=False):
     """Force teardown, like vagrant destroy -f: no prompt, no data preservation."""
     if tofu("state", "list", capture=True).strip():
         project = project_name()
-        if project == "default":
-            raise ValueError("Refusing to tear down the default Incus project")
-        # Graceful guest shutdown only slows teardown of disposable VMs.
+        refuse_default_project(project)
         instances = json.loads(run(["incus", "list", "local:", "--project", project, "--format", "json"],
                                    capture=True))
         running = [item["name"] for item in instances if item["status"] == "Running"]
-        if running:
-            run(["incus", "stop", "--force", *(f"local:{name}" for name in running), "--project", project])
-        tofu("apply", "-destroy", "-auto-approve", "-input=false")
+        if dry_run:
+            plan = plan_infrastructure(destroy=True)
+            print(f"Dry run: would force-stop {', '.join(running) or 'no running VMs'} and destroy "
+                  f"{summarize_plan(plan)}.", file=sys.stderr)
+        else:
+            # Graceful guest shutdown only slows teardown of disposable VMs.
+            if running:
+                run(["incus", "stop", "--force", *(f"local:{name}" for name in running), "--project", project])
+            tofu("apply", "-destroy", "-auto-approve", "-input=false")
+    elif dry_run:
+        print("Dry run: no cluster in state; nothing to destroy.", file=sys.stderr)
+    if dry_run:
+        files = [str(path.relative_to(ROOT)) for path in CLUSTER_FILES if path.exists()]
+        print("Dry run: would delete local files: " + (", ".join(files) or "none") + ".", file=sys.stderr)
+        return
     clear_cluster_files()
 
 
@@ -386,7 +410,9 @@ def main(argv=None):
                                             "destroy", "down", "up", "import-image", "shell"])
     parser.add_argument("node", nargs="?", default="server",
                         help="shell only: server, worker<N>, or a full instance name")
-    parser.add_argument("--confirm", help="Exact project name for apply or up")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="plan, apply, up, down, destroy: run every check and show the changes "
+                             "without making them")
     overrides = parser.add_argument_group("per-run overrides of cluster.yml (not persisted)")
     overrides.add_argument("--ubuntu", help="Ubuntu release, for example 24.04")
     overrides.add_argument("--image-source", choices=IMAGE_SOURCES)
@@ -395,12 +421,14 @@ def main(argv=None):
     overrides.add_argument("--ip-family", choices=list(IP_FAMILIES))
     overrides.add_argument("--storage-network", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args(argv)
+    if args.dry_run and args.command not in ("plan", "apply", "up", "down", "destroy"):
+        raise ValueError(f"--dry-run is not supported by {args.command}")
     for program in ("tofu", "incus", "ip", "ansible-playbook"):
         if not shutil.which(program):
             raise ValueError(f"Missing required command: {program}; run through mise")
     if args.command in ("destroy", "down"):
         # Teardown uses state only, so an invalid cluster.yml cannot block it.
-        destroy()
+        destroy(args.dry_run)
         return
     if args.command == "shell":
         project = project_name()
@@ -419,11 +447,8 @@ def main(argv=None):
     print("Cluster: " + json.dumps(spec, sort_keys=True), file=sys.stderr)
     if args.command == "import-image":
         import_image(spec)
-    elif args.command == "plan":
-        refuse_recreation(spec, applied_spec())
-        preflight(plan_infrastructure(var_file=write_tofu_spec(spec)))
-    elif args.command == "apply":
-        apply_infrastructure(spec, args.confirm)
+    elif args.command in ("plan", "apply"):
+        apply_infrastructure(spec, dry_run=args.dry_run or args.command == "plan")
     elif args.command == "provision":
         refuse_recreation(spec, applied_spec())
         provision(spec)
@@ -432,7 +457,10 @@ def main(argv=None):
         provision(spec, "verify.yml")
     elif args.command == "up":
         tofu("init", "-input=false")
-        apply_infrastructure(spec, args.confirm)
+        if not apply_infrastructure(spec, dry_run=args.dry_run):
+            print(f"Dry run: would then provision K3s {spec['k3s']} and Longhorn {spec['longhorn']}, "
+                  "and verify.", file=sys.stderr)
+            return
         provision(spec)
         record_applied(spec, "k3s", "longhorn")
         provision(spec, "verify.yml")

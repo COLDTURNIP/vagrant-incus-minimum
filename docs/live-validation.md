@@ -1,5 +1,8 @@
 # Initial live validation
 
+Commands are recorded as they were run. `--confirm lh-incus` has since been
+replaced by an optional `--dry-run`.
+
 Validated on 2026-10-24 with Incus 7.5.1, an official Ubuntu 24.04 cloud image,
 K3s v1.34.2+k3s1, and Longhorn 1.13.0. This is a functional lab check, not the
 complete [acceptance matrix](acceptance.md).

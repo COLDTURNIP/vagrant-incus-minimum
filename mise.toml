@@ -81,12 +81,12 @@ description = "Run all local-only validation; never contact Incus or Kubernetes"
 depends = ["validate:ansible"]
 
 [tasks.up]
-description = "Create and provision the cluster described by cluster.yml from scratch, then verify; --confirm PROJECT required"
+description = "Create and provision the cluster described by cluster.yml from scratch, then verify; --dry-run only checks and plans"
 dir = "{{config_root}}"
 run = "python scripts/lab.py up"
 
 [tasks.down]
-description = "Force-delete the disposable cluster and its local secrets, like vagrant destroy -f"
+description = "Force-delete the disposable cluster and its local secrets, like vagrant destroy -f; --dry-run lists what would go"
 dir = "{{config_root}}"
 run = "python scripts/lab.py down"
 
@@ -107,12 +107,12 @@ dir = "{{config_root}}"
 run = "python scripts/lab.py init"
 
 [tasks.plan]
-description = "Read Incus and host routes; plan and check network collisions"
+description = "Same as apply --dry-run: plan and run every check without changing anything"
 dir = "{{config_root}}"
 run = "python scripts/lab.py plan"
 
 [tasks.apply]
-description = "Create infrastructure; requires --confirm PROJECT; refuses replacements"
+description = "Create infrastructure; refuses replacements; --dry-run only checks and plans"
 dir = "{{config_root}}"
 run = "python scripts/lab.py apply"
 
@@ -132,7 +132,7 @@ dir = "{{config_root}}"
 run = "python scripts/lab.py verify"
 
 [tasks.destroy]
-description = "Same as down: force-delete VMs, data volumes, bridges and local cluster secrets"
+description = "Same as down: force-delete VMs, data volumes, bridges and local cluster secrets; --dry-run lists them"
 dir = "{{config_root}}"
 run = "python scripts/lab.py destroy"
 

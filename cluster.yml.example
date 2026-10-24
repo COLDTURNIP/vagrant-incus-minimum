@@ -1,8 +1,8 @@
 # Cluster requirements for the Incus Longhorn lab. Copy to cluster.yml
 # (ignored) and edit.
 #
-# Launch:   mise run up -- --confirm lh-incus
-# Teardown: mise run down            (force, like vagrant destroy -f)
+# Launch:   mise run up               (preview first: mise run up --dry-run)
+# Teardown: mise run down             (force, like vagrant destroy -f)
 #
 # Flags override any value for one run without changing this file:
 #   --ubuntu, --image-source, --k3s, --longhorn, --ip-family,

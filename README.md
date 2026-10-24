@@ -92,7 +92,7 @@ Flags override the file for one run without changing it: `--ubuntu`,
 `--storage-network` / `--no-storage-network`. For example:
 
 ```sh
-mise run up -- --confirm lh-incus --longhorn master-head --ip-family ipv6-dual
+mise run up --longhorn master-head --ip-family ipv6-dual
 ```
 
 Overrides are not saved. Repeat them on a later `provision` or `verify`, or put
@@ -173,25 +173,28 @@ The second bridge permits non-node source addresses for routed storage pods.
 MTU, actual storage-pod traffic, firewall behavior, and reboot recovery remain
 live acceptance requirements, not claims established by mock tests.
 
-## Live lifecycle: explicit approval required
+## Live lifecycle
 
 After the host/pool/subnet decisions are made and `cluster.yml` is written:
 
 ```sh
-mise run plan                        # optional: review the plan and collision checks
-mise run up -- --confirm lh-incus    # init, apply, provision, verify
+mise run up --dry-run                # optional: every check and the plan, no changes
+mise run up                          # init, apply, provision, verify
 kubectl get nodes -o wide             # with KUBECONFIG set as below
 ```
 
-`up` runs the individual steps, which remain available: `init`, `apply -- --confirm
-lh-incus`, `provision`, and `verify`. All of them read `cluster.yml` and accept
-the same per-run flags.
+`up` runs the individual steps, which remain available: `init`, `apply`,
+`provision`, and `verify`. All of them read `cluster.yml` and accept the same
+per-run flags. `--dry-run` works with `up`, `apply`, `down`, and `destroy`;
+`plan` is the same as `apply --dry-run`.
 
-`plan` only reads Incus and host routes and writes a local plan. Preflight
-rejects subnet collisions and existing project/network name collisions.
-`apply` (and `up`) builds a fresh plan, requires the exact project name, and
-refuses any deletion/replacement, including worker removal or a network-layout
-switch. Do not use direct `tofu apply` to bypass the helper's checks.
+`apply` (and `up`) builds a fresh plan and runs every check before changing
+anything. Preflight rejects subnet collisions, existing project/network name
+collisions, and the `default` Incus project. Any deletion or replacement is
+refused, including worker removal or a network-layout switch, and so are new VMs
+on existing data volumes. With `--dry-run` it stops after these checks and
+prints the planned changes. Do not use direct `tofu apply` to bypass the
+helper's checks.
 
 `verify` fails on infrastructure, Kubernetes, and configuration problems: K3s
 services, mounts, Kubernetes node readiness, the Longhorn manager, and the
@@ -267,7 +270,8 @@ also destroys the backup data. NFS runs privileged inside its disposable VM.
 ### Teardown and fresh creation
 
 ```sh
-mise run down        # same as mise run destroy; like vagrant destroy -f
+mise run down --dry-run   # list the VMs, resources, and local files that would go
+mise run down             # same as mise run destroy; like vagrant destroy -f
 ```
 
 The cluster is disposable, so `down` asks nothing and keeps nothing. It

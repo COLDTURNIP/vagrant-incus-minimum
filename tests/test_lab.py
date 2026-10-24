@@ -121,22 +121,31 @@ class OfflineTests(unittest.TestCase):
                     ]})
         lab.refuse_deletions(self.plans[0])
 
-    def test_exact_confirmation_is_required(self):
-        for supplied in (None, "", "other"):
-            with self.assertRaises(ValueError):
-                lab.require_confirmation("lh-incus", supplied)
-        with self.assertRaises(ValueError):
-            lab.require_confirmation("default", "default")
-        lab.require_confirmation("lh-incus", "lh-incus")
+    def test_default_project_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "default Incus project"):
+            lab.refuse_default_project("default")
+        lab.refuse_default_project("lh-incus")
 
-    def test_unconfirmed_apply_never_executes_apply(self):
-        with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
-             patch.object(lab, "plan_infrastructure", return_value=self.plans[0]), \
-             patch.object(lab, "preflight", return_value="lh-incus"), \
-             patch.object(lab, "tofu") as command:
-            with self.assertRaises(ValueError):
-                lab.main(["apply"])
-            command.assert_not_called()
+    def test_dry_run_never_applies_or_provisions(self):
+        for argv in (["apply", "--dry-run"], ["plan"], ["up", "--dry-run"]):
+            with self.subTest(argv=argv), \
+                 patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+                 patch.object(lab, "plan_infrastructure", return_value=self.plans[0]) as planning, \
+                 patch.object(lab, "preflight", return_value="lh-incus"), \
+                 patch.object(lab, "provision") as provisioning, \
+                 patch.object(lab, "inventory") as inventory, \
+                 patch.object(lab, "tofu") as command:
+                lab.main(argv)
+                planning.assert_called_once()
+                provisioning.assert_not_called()
+                inventory.assert_not_called()
+                expected = [(("init", "-input=false"),)] if argv[0] == "up" else []
+                self.assertEqual([tuple(c.args) for c in command.call_args_list],
+                                 [e[0] for e in expected])
+                self.assertFalse(lab.APPLIED_SPEC.exists())
+        with patch.object(lab.shutil, "which", return_value="/bin/tool"):
+            with self.assertRaisesRegex(ValueError, "--dry-run is not supported by provision"):
+                lab.main(["provision", "--dry-run"])
 
     def test_confirmed_apply_still_refuses_replacements(self):
         plan = copy.deepcopy(self.plans[0])
@@ -146,7 +155,7 @@ class OfflineTests(unittest.TestCase):
              patch.object(lab, "preflight", return_value="lh-incus"), \
              patch.object(lab, "tofu") as command:
             with self.assertRaisesRegex(ValueError, "refuses deletions"):
-                lab.main(["apply", "--confirm", "lh-incus"])
+                lab.main(["apply"])
             command.assert_not_called()
 
     def test_down_force_destroys_and_clears_cluster_files(self):
@@ -166,6 +175,18 @@ class OfflineTests(unittest.TestCase):
                                  ["incus", "stop", "--force", "local:lh-incus-server", "--project", "lh-incus"])
                 self.assertEqual(command.call_args_list[2].args, ("apply", "-destroy", "-auto-approve", "-input=false"))
                 self.assertFalse(any(path.exists() for path in cluster_files))
+        for path in cluster_files:
+            path.write_text("old cluster")
+        with patch.object(lab, "CLUSTER_FILES", tuple(cluster_files)), \
+             patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+             patch.object(lab, "tofu", side_effect=["incus_project.cluster\n", '{"project":"lh-incus"}']) as command, \
+             patch.object(lab, "plan_infrastructure", return_value=self.plans[0]) as planning, \
+             patch.object(lab, "run", return_value=instances) as incus:
+            lab.main(["down", "--dry-run"])
+        planning.assert_called_once_with(destroy=True)
+        self.assertEqual(incus.call_count, 1, "a dry run only lists instances")
+        self.assertEqual(command.call_count, 2, "a dry run never applies")
+        self.assertTrue(all(path.exists() for path in cluster_files))
         with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
              patch.object(lab, "tofu", side_effect=["incus_project.cluster\n", '{"project":"default"}']), \
              patch.object(lab, "run") as incus:
@@ -194,13 +215,16 @@ class OfflineTests(unittest.TestCase):
 
     def test_fresh_cluster_creation_clears_old_cluster_files(self):
         stale = self.scratch / "k3s-token"
-        stale.write_text("old cluster")
-        with patch.object(lab, "CLUSTER_FILES", (stale,)), \
-             patch.object(lab, "plan_infrastructure", return_value=self.plans[0]), \
-             patch.object(lab, "preflight", return_value="lh-incus"), \
-             patch.object(lab, "inventory"), patch.object(lab, "tofu"):
-            lab.apply_infrastructure(lab.load_spec(), "lh-incus")
-        self.assertFalse(stale.exists())
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                stale.write_text("old cluster")
+                with patch.object(lab, "CLUSTER_FILES", (stale,)), \
+                     patch.object(lab, "plan_infrastructure", return_value=self.plans[0]), \
+                     patch.object(lab, "preflight", return_value="lh-incus"), \
+                     patch.object(lab, "inventory"), patch.object(lab, "tofu") as command:
+                    self.assertEqual(lab.apply_infrastructure(lab.load_spec(), dry_run=dry_run), not dry_run)
+                self.assertEqual(stale.exists(), dry_run)
+                self.assertEqual(command.called, not dry_run)
 
     def test_shell_maps_short_node_names(self):
         for node, expected in (([], "lh-incus-server"), (["worker2"], "lh-incus-worker2"),
@@ -282,7 +306,7 @@ class OfflineTests(unittest.TestCase):
              patch.object(lab, "tofu", return_value="incus_project.cluster\n"), \
              patch.object(lab, "plan_infrastructure") as planning:
             with self.assertRaisesRegex(ValueError, "ip_family 'ipv4-dual' -> 'ipv6-dual'"):
-                lab.main(["apply", "--confirm", "lh-incus", "--ip-family", "ipv6-dual"])
+                lab.main(["apply", "--ip-family", "ipv6-dual"])
             planning.assert_not_called()
 
     def test_confirmed_apply_uses_cluster_var_file_and_records_it(self):
@@ -291,7 +315,7 @@ class OfflineTests(unittest.TestCase):
              patch.object(lab, "preflight", return_value="lh-incus"), \
              patch.object(lab, "inventory"), \
              patch.object(lab, "tofu") as command:
-            lab.main(["apply", "--confirm", "lh-incus", "--storage-network"])
+            lab.main(["apply", "--storage-network"])
         planning.assert_called_once_with(var_file=lab.TF_SPEC)
         command.assert_called_once_with("apply", "-input=false", str(lab.PLAN))
         recorded = json.loads(lab.APPLIED_SPEC.read_text())
