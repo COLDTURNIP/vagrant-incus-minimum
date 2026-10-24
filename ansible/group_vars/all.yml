@@ -6,6 +6,10 @@ k3s_version: v1.34.2+k3s1
 # charts.longhorn.io. master-head applies deploy/longhorn.yaml from the
 # longhorn/longhorn master branch, which deploys nightly master-head images.
 longhorn_version: v1.13.0
+# Custom component images and local image archives; scripts/lab.py fills
+# these from cluster.yml longhorn_images and image_archives.
+longhorn_image_overrides: {}
+longhorn_image_archives: []
 install_longhorn: true
 v2_hugepages: false
 backup_target: garage  # garage, nfs, or none

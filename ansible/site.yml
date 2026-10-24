@@ -60,6 +60,13 @@
   roles:
     - k3s
 
+- name: Import local image archives
+  hosts: servers:workers
+  gather_facts: false
+  roles:
+    - role: images
+      when: longhorn_image_archives | length > 0
+
 - name: Export kubeconfig
   hosts: servers
   gather_facts: false

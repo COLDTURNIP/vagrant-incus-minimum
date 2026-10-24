@@ -56,6 +56,14 @@ for version in versions:
                     and any("v2-data-engine" in str(value) for value in doc.get("data", {}).values())]
         if not settings:
             raise RuntimeError("Chart did not render expected Longhorn default settings")
+        overrides = (yaml.safe_load(values.read_text()).get("image") or {}).get("longhorn", {})
+        for component, image in overrides.items():
+            reference = image["registry"] + "/" + image["repository"] + ":" + image["tag"]
+            # Exactly once-prefixed: no extra registry in front of the reference.
+            if reference not in result.stdout or "/" + reference in result.stdout:
+                raise RuntimeError(f"Chart did not render the {component} image override {reference}")
+        if "instanceManager" in overrides and "--instance-manager-image" not in result.stdout:
+            raise RuntimeError("Chart no longer passes --instance-manager-image to longhorn-manager")
         print("Longhorn chart " + chart_version + " OK: " + values.name)
 result = subprocess.run([
     "helm", "template", "multus", defaults["multus_chart_url"],

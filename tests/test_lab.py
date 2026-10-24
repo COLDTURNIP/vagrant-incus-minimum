@@ -287,7 +287,92 @@ class OfflineTests(unittest.TestCase):
                 lab.resolve_image(lab.load_spec({"image_source": "official", "ubuntu": "26.04"}))
         lab.write_ansible_spec(lab.load_spec({"longhorn": "master-head"}))
         self.assertEqual(json.loads(lab.ANSIBLE_SPEC.read_text()),
-                         {"k3s_version": lab.load_spec()["k3s"], "longhorn_version": "master-head"})
+                         {"k3s_version": lab.load_spec()["k3s"], "longhorn_version": "master-head",
+                          "longhorn_image_overrides": {}, "longhorn_image_archives": []})
+
+    def test_custom_image_spec_validation_and_mapping(self):
+        archive = self.scratch / "manager.tar"
+        archive.write_bytes(b"tar")
+        images = {"manager": "docker.io/me/longhorn-manager:fix-1", "instance_manager": "reg:5000/im:fix-1"}
+        spec = lab.load_spec({"longhorn_images": images, "image_archives": [str(archive)]})
+        self.assertEqual(spec["image_archives"], [str(archive.resolve())])
+        lab.write_ansible_spec(spec)
+        written = json.loads(lab.ANSIBLE_SPEC.read_text())
+        self.assertEqual(written["longhorn_image_overrides"], images)
+        self.assertEqual(written["longhorn_image_archives"], [str(archive.resolve())])
+        lab.SPEC_FILE.write_text("longhorn_images:\nimage_archives:\n")
+        self.assertEqual((lab.load_spec()["longhorn_images"], lab.load_spec()["image_archives"]), ({}, []))
+        lab.SPEC_FILE.unlink()
+        for overrides, message in (
+                ({"longhorn_images": {"csi": "a/b:c"}}, "longhorn_images key 'csi'"),
+                ({"longhorn_images": {"ui": "docker.io/me/ui"}}, "expected repository:tag"),
+                ({"longhorn_images": {"ui": "reg:5000/ui"}}, "expected repository:tag"),
+                ({"longhorn_images": {"ui": "me/ui@sha256:abc"}}, "expected repository:tag"),
+                ({"longhorn_images": ["me/ui:x"]}, "expected a mapping"),
+                ({"image_archives": "x.tar"}, "expected a list"),
+                ({"image_archives": [str(self.scratch / "missing.tar")]}, "Image archive not found")):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
+                lab.load_spec(overrides)
+
+    def test_custom_images_in_helm_values(self):
+        plan = self.plans[0]
+        hostname = next(iter(plan["planned_values"]["outputs"]["inventory"]["value"]["all"]["children"]["workers"]["hosts"]))
+        context = self.context(plan, hostname)
+        self.assertNotIn("image", yaml.safe_load(self.render("ansible/roles/longhorn/templates/values.yml.j2", context)))
+        context["longhorn_image_overrides"] = {"instance_manager": "reg:5000/me/longhorn-instance-manager:fix-1",
+                                               "ui": "docker.io/me/longhorn-ui:fix-1",
+                                               "manager": "me/longhorn-manager:fix-1",
+                                               "engine": "localhost/longhorn-engine:fix-1"}
+        values = yaml.safe_load(self.render("ansible/roles/longhorn/templates/values.yml.j2", context))
+        self.assertEqual(values["image"]["longhorn"], {
+            "instanceManager": {"registry": "reg:5000", "repository": "me/longhorn-instance-manager", "tag": "fix-1"},
+            "ui": {"registry": "docker.io", "repository": "me/longhorn-ui", "tag": "fix-1"},
+            "manager": {"registry": "docker.io", "repository": "me/longhorn-manager", "tag": "fix-1"},
+            "engine": {"registry": "localhost", "repository": "longhorn-engine", "tag": "fix-1"}})
+        # validate:charts renders this file with the released chart and checks the images.
+        (lab.STATE / "rendered" / "longhorn-images-v2-True-custom.yml").write_text(yaml.safe_dump(values))
+
+    def test_master_head_manifest_image_rewrite_with_ansible(self):
+        tasks = yaml.safe_load((ROOT / "ansible/roles/longhorn/tasks/manifest.yml").read_text())
+        names = ("Use the declared Longhorn component images", "Require every declared image in the manifest")
+        selected = [task for task in tasks if task["name"] in names]
+        self.assertEqual(len(selected), len(names))
+        upstream = yaml.safe_load((ROOT / "ansible/roles/longhorn/vars/main.yml").read_text())["longhorn_upstream_images"]
+        manager = {"kind": "DaemonSet", "metadata": {"name": "longhorn-manager"}, "spec": {"template": {"spec": {
+            "containers": [{"name": "longhorn-manager", "image": "docker.io/longhornio/longhorn-manager:master-head",
+                            "command": ["longhorn-manager", "daemon",
+                                        "--instance-manager-image", "docker.io/longhornio/longhorn-instance-manager:master-head",
+                                        "--share-manager-image", "longhornio/longhorn-share-manager:master-head",
+                                        "--manager-image", "docker.io/longhornio/longhorn-manager:master-head"]}]}}}}
+        ui = {"kind": "Deployment", "metadata": {"name": "longhorn-ui"}, "spec": {"template": {"spec": {
+            "containers": [{"name": "longhorn-ui", "image": "longhornio/longhorn-ui:master-head-extra"}]}}}}
+        output = lab.STATE / "image-rewrite.json"
+        overrides = {"manager": "docker.io/me/longhorn-manager:fix-1",
+                     "instance_manager": "docker.io/me/longhorn-instance-manager:fix-1",
+                     "share_manager": "docker.io/me/longhorn-share-manager:fix-1"}
+        for case, images, passes in (("rewrite", overrides, True),
+                                     ("absent", {"ui": "docker.io/me/longhorn-ui:fix-1"}, False)):
+            with self.subTest(case=case):
+                play = [{"name": "Check image rewrite", "hosts": "localhost", "gather_facts": False,
+                         "vars": {"longhorn_manifest_documents": [manager, ui], "longhorn_image_overrides": images,
+                                  "longhorn_upstream_images": upstream},
+                         "tasks": selected + [{"name": "Write", "ansible.builtin.copy": {
+                             "content": "{{ longhorn_manifest_documents | to_json }}", "dest": str(output),
+                             "mode": "0600"}}]}]
+                path = lab.STATE / "image-rewrite-test.yml"
+                path.write_text(yaml.safe_dump(play), encoding="ascii")
+                result = subprocess.run(["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+                                        cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stdout[-2000:])
+                if passes:
+                    documents = json.loads(output.read_text())
+                    container = documents[0]["spec"]["template"]["spec"]["containers"][0]
+                    self.assertEqual(container["image"], overrides["manager"])
+                    self.assertEqual(container["command"], [
+                        "longhorn-manager", "daemon", "--instance-manager-image", overrides["instance_manager"],
+                        "--share-manager-image", overrides["share_manager"], "--manager-image", overrides["manager"]])
+                    # A longer tag that merely starts with master-head is left alone.
+                    self.assertEqual(documents[1], ui)
 
     def test_recreation_changes_are_refused_before_planning(self):
         applied = {**lab.load_spec(), "longhorn": "v1.13.0"}

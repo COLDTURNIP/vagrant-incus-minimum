@@ -1,0 +1,25 @@
+---
+# Import local image archives into each node's K3s containerd (namespace
+# k8s.io), so pods can use images that are in no registry.
+- name: Create the image archive directory
+  ansible.builtin.file:
+    path: /var/lib/incus-lab/images
+    state: directory
+    mode: "0700"
+
+- name: Copy local image archives
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    # The path hash keeps archives with the same file name apart.
+    dest: "/var/lib/incus-lab/images/{{ item | hash('sha1') }}-{{ item | basename }}"
+    mode: "0600"
+  loop: "{{ longhorn_image_archives }}"
+  register: images_copied
+
+- name: Import archives whose content changed
+  ansible.builtin.command:
+    argv: [k3s, ctr, images, import, "{{ item.dest }}"]
+  loop: "{{ images_copied.results | selectattr('changed') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true

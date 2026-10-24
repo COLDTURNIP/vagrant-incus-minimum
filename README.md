@@ -90,6 +90,8 @@ cp cluster.yml.example cluster.yml
 | `longhorn` | `vX.Y.Z` (Helm chart) or `master-head` (master branch manifest) | `v1.13.0` |
 | `ip_family` | `ipv4-single`, `ipv6-single`, `ipv4-dual` (IPv4 first), `ipv6-dual` (IPv6 first) | `ipv4-dual` |
 | `storage_network` | `true` / `false`: Multus storage network for Longhorn | `false` |
+| `longhorn_images` | component to `repository:tag`; see [custom container images](#custom-container-images) | `{}` |
+| `image_archives` | local image archive paths imported on every node | `[]` |
 
 Flags override the file for one run without changing it: `--ubuntu`,
 `--image-source`, `--k3s`, `--longhorn`, `--ip-family`, and
@@ -270,6 +272,88 @@ and retain their data on the server's K3s disk across pod restarts. Switching
 targets does not garbage-collect the old target. These are single-node test
 stores, not independent disaster-recovery backups; destroying the cluster
 also destroys the backup data. NFS runs privileged inside its disposable VM.
+
+### Custom container images
+
+Use this to test a patched Longhorn component or any image that is not in a
+registry. Requirements for every image:
+
+- Built for the guests' architecture: `linux/amd64` on x86_64 hosts. Check with
+  `incus exec local:lh-incus-worker1 --project lh-incus -- uname -m`.
+- Referenced as `repository:tag` with a tag other than `latest`. Longhorn and
+  the lab use pull policy `IfNotPresent`, so an imported image is used as long
+  as its exact name is present on the node.
+- Saved to an archive when it is in no registry the guests can reach:
+  `docker save -o longhorn-manager-fix-1234.tar docker.io/me/longhorn-manager:fix-1234`
+  (`podman save` works the same way).
+
+**Declare it in `cluster.yml` (recommended).** Provisioning then imports the
+archives and installs or updates Longhorn with the images, and later provisions
+keep them:
+
+```yaml
+longhorn_images:
+  manager: docker.io/me/longhorn-manager:fix-1234
+  instance_manager: docker.io/me/longhorn-instance-manager:fix-1234
+image_archives:
+  - ~/images/longhorn-manager-fix-1234.tar
+  - ~/images/longhorn-instance-manager-fix-1234.tar
+```
+
+Then run `mise run provision` on an existing cluster or `mise run up` for a new
+one. The keys are `manager`, `engine`, `instance_manager`, `share_manager`,
+`backing_image_manager`, and `ui`. Each archive is copied to every node and
+imported into K3s containerd before Longhorn is installed, and imported again
+only when its content changes. Every reference to a declared component image is
+replaced: container images and the `longhorn-manager` DaemonSet arguments
+`--manager-image`, `--engine-image`, `--instance-manager-image`,
+`--share-manager-image`, and `--backing-image-manager-image`. Remove the
+entries and provision again to return to the official images.
+
+**Import by hand with `k3s ctr`.** For a quick experiment, or for images that
+are not Longhorn components, such as a test workload:
+
+```sh
+IMAGE_TAR=./longhorn-instance-manager-fix-1234.tar
+for vm in lh-incus-server lh-incus-worker1 lh-incus-worker2 lh-incus-worker3; do
+  incus file push "$IMAGE_TAR" "local:$vm/tmp/image.tar" --project lh-incus
+  incus exec "local:$vm" --project lh-incus -- k3s ctr images import /tmp/image.tar
+  incus exec "local:$vm" --project lh-incus -- rm /tmp/image.tar
+done
+incus exec local:lh-incus-worker1 --project lh-incus -- k3s ctr images ls -q | grep fix-1234
+```
+
+`k3s ctr` uses the `k8s.io` containerd namespace, the one kubelet reads.
+Import on every node that may run the image; Longhorn components run on all
+workers.
+
+**Switch a Longhorn component by hand.** The engine, instance-manager,
+share-manager, and backing-image-manager images are not set on their own pods:
+`longhorn-manager` creates those pods from its DaemonSet arguments. Changing a
+Deployment or pod image is not enough; edit the DaemonSet argument instead:
+
+```sh
+kubectl -n longhorn-system get daemonset longhorn-manager -o yaml \
+  | sed 's#docker.io/longhornio/longhorn-instance-manager:master-head#docker.io/me/longhorn-instance-manager:fix-1234#g' \
+  | kubectl replace -f -
+kubectl -n longhorn-system rollout status daemonset/longhorn-manager
+kubectl -n longhorn-system get settings.longhorn.io default-instance-manager-image
+```
+
+Use the official reference your cluster runs (`kubectl -n longhorn-system get
+daemonset longhorn-manager -o yaml | grep image`); releases use a version tag
+instead of `master-head`. The manager image also appears in the
+`longhorn-driver-deployer` and `longhorn-global-manager` Deployments, so declare
+`manager` in `cluster.yml` rather than swapping it by hand. The UI is a plain
+Deployment: `kubectl -n longhorn-system set image deployment/longhorn-ui
+longhorn-ui=<image>`. Hand-made changes last only until provisioning re-applies
+the declared images.
+
+With no volumes attached, Longhorn replaces the instance managers right after
+the DaemonSet rolls out; the V2 ones take about two minutes. Attached volumes
+keep their running engine and instance manager until they are detached or
+upgraded, following Longhorn's upgrade rules. For a clean result, detach volumes
+first or recreate the cluster with `mise run down` and `mise run up`.
 
 ### Teardown and fresh creation
 

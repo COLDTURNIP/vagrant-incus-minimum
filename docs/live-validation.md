@@ -116,6 +116,31 @@ this lab exists to test Longhorn and a non-green node or disk can be the bug
 under investigation. Infrastructure, Kubernetes, and configuration checks still
 fail verify. Logs are in `.state/live/race/`.
 
+## Custom container images
+
+On the master-head cluster, an official image was retagged under a name that
+exists in no registry (`docker.io/example/...:incus-custom-test`), exported
+with `k3s ctr images export`, and used as a stand-in for a locally built image.
+
+- Manual UI swap: importing the archive on every node with `k3s ctr images
+  import` and running `kubectl set image deployment/longhorn-ui` worked. The
+  next `mise run provision` then failed with a server-side apply conflict on
+  the image field owned by `kubectl-set`. The manifest apply now forces
+  ownership, so provisioning restores the declared images instead.
+- Manual instance-manager swap: with no volumes attached, replacing
+  `--instance-manager-image` in the `longhorn-manager` DaemonSet changed
+  `default-instance-manager-image` and replaced all six instance managers
+  (V1 at once, V2 after about two minutes). `mise run provision` then restored
+  the official image without a conflict.
+- Declared in `cluster.yml`: with the image removed from every node,
+  `longhorn_images.instance_manager` plus `image_archives` made provisioning
+  import the archive on all four nodes, rewrite the DaemonSet argument, and run
+  all six instance managers on the declared image. A second provision kept the
+  copies and skipped re-importing. Removing the entries and provisioning
+  returned to the official image.
+
+Logs are in `.state/live/custom-image/`.
+
 ## Recovery and provisioning corrections
 
 The original `images:` cloud image boot-looped before its agent became usable.

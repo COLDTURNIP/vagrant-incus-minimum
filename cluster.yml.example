@@ -48,3 +48,25 @@ ip_family: ipv4-dual
 # Dedicated Multus storage network for Longhorn replica traffic.
 # Values: true or false
 storage_network: false
+
+# Custom Longhorn component images, for testing a patched build. Each value is
+# repository:tag (no digest); components left out keep the selected version's
+# images. Provisioning sets every place a component image is referenced,
+# including the longhorn-manager DaemonSet arguments that choose the engine,
+# instance-manager, share-manager, and backing-image-manager images.
+# Keys: manager, engine, instance_manager, share_manager,
+#       backing_image_manager, ui
+# Example:
+#   longhorn_images:
+#     manager: docker.io/me/longhorn-manager:fix-1234
+#     instance_manager: docker.io/me/longhorn-instance-manager:fix-1234
+longhorn_images: {}
+
+# Local image archives (docker save or podman save output) imported into
+# every node's K3s containerd before Longhorn is installed, for images that are
+# in no registry. Paths are absolute, ~-relative, or relative to this
+# directory. An archive is imported again only when its content changes.
+# Example:
+#   image_archives:
+#     - ~/images/longhorn-manager-fix-1234.tar
+image_archives: []

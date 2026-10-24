@@ -49,6 +49,28 @@
         | selectattr('metadata.name', 'eq', 'longhorn-manager') | list | length == 1
     fail_msg: The upstream manifest layout changed; review the customization before applying it.
 
+- name: Use the declared Longhorn component images
+  # Replaces every reference, including the longhorn-manager DaemonSet
+  # arguments (--engine-image, --instance-manager-image, --share-manager-image,
+  # --backing-image-manager-image, --manager-image) that pick component images.
+  ansible.builtin.set_fact:
+    longhorn_manifest_documents: >-
+      {{ longhorn_manifest_documents | to_json
+         | replace('"docker.io/' ~ longhorn_upstream_images[item.key] ~ ':master-head"', '"' ~ item.value ~ '"')
+         | replace('"' ~ longhorn_upstream_images[item.key] ~ ':master-head"', '"' ~ item.value ~ '"')
+         | from_json }}
+  loop: "{{ longhorn_image_overrides | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Require every declared image in the manifest
+  ansible.builtin.assert:
+    that: ('"' ~ item.value ~ '"') in (longhorn_manifest_documents | to_json)
+    fail_msg: "{{ item.key }} image reference not found in the upstream manifest; review the image rewrite."
+  loop: "{{ longhorn_image_overrides | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
 - name: Save the applied manifest for inspection
   ansible.builtin.copy:
     content: "{{ longhorn_manifest_documents | map('to_nice_json') | join('\n---\n') }}"
@@ -62,6 +84,9 @@
     apply: true
     server_side_apply:
       field_manager: incus-lab
+      # Provisioning owns the declared state: take over fields changed by hand
+      # (for example kubectl set image) instead of failing on the conflict.
+      force_conflicts: true
 
 - name: Wait for the Longhorn manager and CSI plugin on every worker
   kubernetes.core.k8s_info:

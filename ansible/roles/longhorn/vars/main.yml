@@ -1,6 +1,14 @@
 ---
 longhorn_helm_install: "{{ longhorn_version != 'master-head' }}"
 longhorn_manifest_url: https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
+# cluster.yml longhorn_images keys -> upstream repositories in the master-head manifest.
+longhorn_upstream_images:
+  manager: longhornio/longhorn-manager
+  engine: longhornio/longhorn-engine
+  instance_manager: longhornio/longhorn-instance-manager
+  share_manager: longhornio/longhorn-share-manager
+  backing_image_manager: longhornio/backing-image-manager
+  ui: longhornio/longhorn-ui
 longhorn_replica_count: "{{ [groups['workers'] | length, 3] | min }}"
 # Ready and Schedulable on every V1 (and V2) disk of every worker.
 longhorn_ready_disk_conditions: "{{ groups['workers'] | length * (2 if incus_enable_v2 else 1) * 2 }}"

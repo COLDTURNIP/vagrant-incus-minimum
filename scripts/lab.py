@@ -32,6 +32,8 @@ IMAGE_SOURCES = ("images", "official")
 # Changing these replaces VMs or the network layout, which apply refuses.
 RECREATE_KEYS = ("ubuntu", "image_source", "ip_family", "storage_network")
 OFFICIAL_IMAGES = "https://cloud-images.ubuntu.com/releases/{ubuntu}/release/"
+# Longhorn components whose image cluster.yml may replace (longhorn_images keys).
+LONGHORN_IMAGE_KEYS = ("manager", "engine", "instance_manager", "share_manager", "backing_image_manager", "ui")
 # Per-cluster local files. Removed by down and before a fresh cluster is created,
 # so a new cluster never inherits a token, credentials, or certificates.
 CLUSTER_FILES = (
@@ -100,6 +102,27 @@ def load_spec(overrides=None):
     for key, valid, expected in checks:
         if not valid:
             raise ValueError(f"Invalid {key}: {spec[key]!r}; expected {expected}")
+    spec["longhorn_images"] = spec["longhorn_images"] or {}
+    spec["image_archives"] = spec["image_archives"] or []
+    if not isinstance(spec["longhorn_images"], dict):
+        raise ValueError("Invalid longhorn_images: expected a mapping of component to image")
+    for component, image in spec["longhorn_images"].items():
+        if component not in LONGHORN_IMAGE_KEYS:
+            raise ValueError(f"Invalid longhorn_images key {component!r}; expected one of "
+                             + ", ".join(LONGHORN_IMAGE_KEYS))
+        repository, _, tag = str(image).rpartition(":")
+        if not repository or not tag or "/" in tag or "@" in str(image) or re.search(r"\s", str(image)):
+            raise ValueError(f"Invalid longhorn_images.{component}: {image!r}; expected repository:tag")
+    if not isinstance(spec["image_archives"], list):
+        raise ValueError("Invalid image_archives: expected a list of image archive paths")
+    archives = []
+    for archive in spec["image_archives"]:
+        path = Path(str(archive)).expanduser()
+        path = path if path.is_absolute() else ROOT / path
+        if not path.is_file():
+            raise ValueError(f"Image archive not found: {archive}")
+        archives.append(str(path.resolve()))
+    spec["image_archives"] = archives
     return spec
 
 
@@ -133,7 +156,10 @@ def write_tofu_spec(spec):
 
 
 def write_ansible_spec(spec):
-    write_private_json(ANSIBLE_SPEC, {"k3s_version": spec["k3s"], "longhorn_version": spec["longhorn"]})
+    write_private_json(ANSIBLE_SPEC, {
+        "k3s_version": spec["k3s"], "longhorn_version": spec["longhorn"],
+        "longhorn_image_overrides": spec["longhorn_images"], "longhorn_image_archives": spec["image_archives"],
+    })
     return ANSIBLE_SPEC
 
 

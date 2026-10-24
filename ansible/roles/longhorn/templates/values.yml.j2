@@ -14,3 +14,22 @@ defaultSettings:
 defaultBackupStore:
   backupTarget: {{ longhorn_backup_url | to_json }}
   backupTargetCredentialSecret: {{ ('incus-backup-credentials' if backup_target == 'garage' else '') | to_json }}
+{% if longhorn_image_overrides %}
+{% set chart_keys = {'manager': 'manager', 'engine': 'engine', 'instance_manager': 'instanceManager',
+                     'share_manager': 'shareManager', 'backing_image_manager': 'backingImageManager',
+                     'ui': 'ui'} %}
+image:
+  longhorn:
+{% for component, reference in longhorn_image_overrides | dictsort %}
+{#   The chart renders <registry>/<repository>:<tag>, defaulting to docker.io.
+     As in Docker, the first path part is a registry only if it has a dot or a
+     port, or is localhost. #}
+{%   set name, _, tag = reference.rpartition(':') %}
+{%   set first, slash, rest = name.partition('/') %}
+{%   set has_registry = slash and ('.' in first or ':' in first or first == 'localhost') %}
+    {{ chart_keys[component] }}:
+      registry: {{ (first if has_registry else 'docker.io') | to_json }}
+      repository: {{ (rest if has_registry else name) | to_json }}
+      tag: {{ tag | to_json }}
+{% endfor %}
+{% endif %}
