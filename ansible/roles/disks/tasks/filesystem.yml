@@ -14,7 +14,7 @@
 - name: Require the intended disk identity
   ansible.builtin.assert:
     that:
-      - disks_serial.stdout | trim == 'incus_' ~ ({'k3s':'k3s', 'logs':'logs', 'v1':'longhorn-v1'}[disks_item.key])
+      - disks_serial.stdout | trim == disks_item.value.serial
     fail_msg: Refusing to format a disk with an unexpected identity.
 
 - name: Create a filesystem without overwriting an existing filesystem

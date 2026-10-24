@@ -34,7 +34,8 @@ locals {
       key = "${key}-${kind}", node = key, kind = kind, size = var.disk_sizes[kind]
     }
   ]]) : disk.key => disk }
-  device_names = { k3s = "k3s", logs = "logs", v1 = "longhorn-v1", v2 = "longhorn-v2" }
+  device_names   = { k3s = "k3s", logs = "logs", v1 = "longhorn-v1", v2 = "longhorn-v2" }
+  device_serials = { for kind, name in local.device_names : kind => "incus_${replace(name, "-", "--")}" }
   hostvars = { for key, node in local.nodes : node.name => {
     incus_role       = node.role
     incus_node_ips   = compact(local.ipv6_first ? [node.ipv6, node.ipv4] : [node.ipv4, node.ipv6])
@@ -43,7 +44,8 @@ locals {
     incus_storage_v4 = node.storage_v4
     incus_storage_v6 = node.storage_v6
     incus_disks = { for disk in values(local.disks) : disk.kind => {
-      device = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_incus_${local.device_names[disk.kind]}"
+      device = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_${local.device_serials[disk.kind]}"
+      serial = local.device_serials[disk.kind]
       mount  = lookup({ k3s = "/var/lib/rancher", logs = "/var/log", v1 = "/var/lib/longhorn" }, disk.kind, "")
     } if disk.node == key }
   } }

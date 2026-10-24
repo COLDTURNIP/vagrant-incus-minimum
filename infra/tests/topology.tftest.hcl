@@ -11,6 +11,10 @@ run "ipv4" {
     condition     = output.inventory.all.vars.incus_server_url == "https://172.28.156.20:6443" && length(output.inventory.all.vars.incus_pod_cidrs) == 1 && output.inventory.all.vars.incus_pod_cidrs[0] == "10.42.0.0/16"
     error_message = "IPv4 endpoint and pod CIDRs must match."
   }
+  assert {
+    condition     = output.inventory.all.children.workers.hosts["lh-incus-worker1"].incus_disks.v1.serial == "incus_longhorn--v1" && endswith(output.inventory.all.children.workers.hosts["lh-incus-worker1"].incus_disks.v2.device, "_incus_longhorn--v2")
+    error_message = "Incus escapes hyphens in disk serials; inventory must use the actual by-id identity."
+  }
 }
 run "ipv6" {
   command = plan
