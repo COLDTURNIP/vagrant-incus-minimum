@@ -1,0 +1,15 @@
+---
+longhorn_helm_install: "{{ longhorn_version != 'master-head' }}"
+longhorn_manifest_url: https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
+longhorn_replica_count: "{{ [groups['workers'] | length, 3] | min }}"
+# Applied before first start (manifest default settings) and reconciled afterward.
+longhorn_settings:
+  create-default-disk-labeled-nodes: "true"
+  default-data-path: /var/lib/longhorn
+  default-replica-count: "{{ longhorn_replica_count }}"
+  v2-data-engine: "{{ 'true' if incus_enable_v2 else 'false' }}"
+  data-engine-hugepage-enabled: "{{ {'v2': 'true' if v2_hugepages else 'false'} | to_json }}"
+  data-engine-interrupt-mode-enabled: '{"v2":"false"}'
+  storage-network: "{{ 'longhorn-system/' ~ storage_network_name if incus_storage_network else '' }}"
+  allow-collecting-longhorn-usage-metrics: "false"
+  storage-reserved-percentage-for-default-disk: "0"

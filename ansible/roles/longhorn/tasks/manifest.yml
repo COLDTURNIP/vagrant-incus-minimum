@@ -1,0 +1,81 @@
+---
+- name: Download the master branch manifest
+  ansible.builtin.uri:
+    url: "{{ longhorn_manifest_url }}"
+    return_content: true
+  register: longhorn_manifest
+
+- name: Parse the manifest documents
+  ansible.builtin.set_fact:
+    longhorn_manifest_all: "{{ longhorn_manifest.content | ansible.builtin.from_yaml_all | select | list }}"
+    longhorn_manifest_configmaps: []
+
+- name: Customize default settings and the default StorageClass before first start
+  ansible.builtin.set_fact:
+    longhorn_manifest_configmaps: >-
+      {{ longhorn_manifest_configmaps
+         + [item | combine(longhorn_configmap_overrides.get(item.metadata.name, {}), recursive=true)] }}
+  loop: "{{ longhorn_manifest_all | selectattr('kind', 'eq', 'ConfigMap') | list }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  vars:
+    longhorn_configmap_overrides:
+      longhorn-default-setting:
+        data:
+          default-setting.yaml: >-
+            {{ ((item.data.get('default-setting.yaml', '') | from_yaml) or {})
+               | combine(longhorn_settings) | to_nice_yaml }}
+      longhorn-storageclass:
+        data:
+          storageclass.yaml: >-
+            {{ ((item.data.get('storageclass.yaml', '') | from_yaml) or {})
+               | combine({'parameters': {'numberOfReplicas': longhorn_replica_count | string}}, recursive=true)
+               | to_nice_yaml }}
+
+- name: Order the namespace and customized ConfigMaps before Longhorn workloads
+  ansible.builtin.set_fact:
+    longhorn_manifest_documents: >-
+      {{ (longhorn_manifest_all | selectattr('kind', 'eq', 'Namespace') | list)
+         + longhorn_manifest_configmaps
+         + (longhorn_manifest_all | rejectattr('kind', 'in', ['Namespace', 'ConfigMap']) | list) }}
+
+- name: Require the expected master-head manifest content
+  ansible.builtin.assert:
+    that:
+      - longhorn_manifest_configmaps | selectattr('metadata.name', 'eq', 'longhorn-default-setting') | list | length == 1
+      - longhorn_manifest_configmaps | selectattr('metadata.name', 'eq', 'longhorn-storageclass') | list | length == 1
+      - >-
+        longhorn_manifest_documents | selectattr('kind', 'eq', 'DaemonSet')
+        | selectattr('metadata.name', 'eq', 'longhorn-manager') | list | length == 1
+    fail_msg: The upstream manifest layout changed; review the customization before applying it.
+
+- name: Save the applied manifest for inspection
+  ansible.builtin.copy:
+    content: "{{ longhorn_manifest_documents | map('to_nice_json') | join('\n---\n') }}"
+    dest: "{{ project_root }}/shared/longhorn-manifest.yml"
+    mode: "0600"
+
+- name: Apply the master-head manifest server-side
+  kubernetes.core.k8s:
+    kubeconfig: "{{ kubeconfig_path }}"
+    definition: "{{ longhorn_manifest_documents }}"
+    apply: true
+    server_side_apply:
+      field_manager: incus-lab
+
+- name: Wait for the Longhorn manager and CSI plugin on every worker
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ kubeconfig_path }}"
+    api_version: apps/v1
+    kind: DaemonSet
+    name: "{{ item }}"
+    namespace: longhorn-system
+  loop: [longhorn-manager, longhorn-csi-plugin]
+  register: longhorn_daemonsets
+  until: >-
+    longhorn_daemonsets.resources | default([]) | length == 1 and
+    longhorn_daemonsets.resources[0].status.desiredNumberScheduled | default(0) >= groups['workers'] | length and
+    longhorn_daemonsets.resources[0].status.numberReady | default(0) == longhorn_daemonsets.resources[0].status.desiredNumberScheduled and
+    longhorn_daemonsets.resources[0].status.updatedNumberScheduled | default(0) == longhorn_daemonsets.resources[0].status.desiredNumberScheduled
+  retries: 90
+  delay: 10

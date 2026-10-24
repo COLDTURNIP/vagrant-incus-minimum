@@ -145,6 +145,53 @@ class OfflineTests(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[:2], ("output", "-json"))
 
+    def test_master_head_manifest_customization_with_ansible(self):
+        tasks = yaml.safe_load((ROOT / "ansible/roles/longhorn/tasks/manifest.yml").read_text())
+        names = ("Parse the manifest documents",
+                 "Customize default settings and the default StorageClass before first start",
+                 "Order the namespace and customized ConfigMaps before Longhorn workloads",
+                 "Require the expected master-head manifest content")
+        selected = [task for task in tasks if task["name"] in names]
+        self.assertEqual(len(selected), len(names))
+        storageclass = {"kind": "StorageClass", "apiVersion": "storage.k8s.io/v1",
+                        "metadata": {"name": "longhorn"},
+                        "parameters": {"numberOfReplicas": "3", "dataEngine": "v1"}}
+        upstream = [
+            {"kind": "Namespace", "apiVersion": "v1", "metadata": {"name": "longhorn-system"}},
+            {"kind": "CustomResourceDefinition", "apiVersion": "apiextensions.k8s.io/v1",
+             "metadata": {"name": "nodes.longhorn.io"}},
+            {"kind": "ConfigMap", "apiVersion": "v1", "metadata": {"name": "longhorn-default-resource"},
+             "data": {"default-resource.yaml": ""}},
+            {"kind": "ConfigMap", "apiVersion": "v1", "metadata": {"name": "longhorn-default-setting"},
+             "data": {"default-setting.yaml": 'priority-class: "longhorn-critical"\n'}},
+            {"kind": "ConfigMap", "apiVersion": "v1", "metadata": {"name": "longhorn-storageclass"},
+             "data": {"storageclass.yaml": yaml.safe_dump(storageclass)}},
+            {"kind": "DaemonSet", "apiVersion": "apps/v1", "metadata": {"name": "longhorn-manager"}},
+        ]
+        settings = {"create-default-disk-labeled-nodes": "true",
+                    "data-engine-hugepage-enabled": '{"v2":"false"}',
+                    "storage-network": "longhorn-system/incus-storage-network"}
+        output = lab.STATE / "manifest-test.json"
+        play = [{"name": "Check manifest customization", "hosts": "localhost", "gather_facts": False,
+                 "vars": {"longhorn_manifest": {"content": yaml.safe_dump_all(upstream)},
+                          "longhorn_settings": settings, "longhorn_replica_count": 2},
+                 "tasks": selected + [{"name": "Write the result", "ansible.builtin.copy": {
+                     "content": "{{ longhorn_manifest_documents | to_json }}",
+                     "dest": str(output), "mode": "0600"}}]}]
+        path = lab.STATE / "manifest-test.yml"
+        path.write_text(yaml.safe_dump(play), encoding="ascii")
+        subprocess.run(["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+                       cwd=ROOT, check=True, capture_output=True, text=True)
+        documents = json.loads(output.read_text())
+        self.assertEqual([d["kind"] for d in documents[:4]], ["Namespace", "ConfigMap", "ConfigMap", "ConfigMap"])
+        self.assertEqual(len(documents), len(upstream))
+        configmaps = {d["metadata"]["name"]: d["data"] for d in documents if d["kind"] == "ConfigMap"}
+        merged = yaml.safe_load(configmaps["longhorn-default-setting"]["default-setting.yaml"])
+        self.assertEqual(merged, {"priority-class": "longhorn-critical", **settings})
+        rendered_class = yaml.safe_load(configmaps["longhorn-storageclass"]["storageclass.yaml"])
+        self.assertEqual(rendered_class["parameters"], {"numberOfReplicas": "2", "dataEngine": "v1"})
+        self.assertEqual(configmaps["longhorn-default-resource"], {"default-resource.yaml": ""})
+
     def test_k3s_checksum_selection_with_ansible(self):
         tasks = yaml.safe_load((ROOT / "ansible/roles/k3s/tasks/main.yml").read_text())
         selection = next(task for task in tasks if task["name"] == "Select the exact binary checksum")
