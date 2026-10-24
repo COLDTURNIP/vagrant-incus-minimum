@@ -13,7 +13,7 @@
 - name: Select the exact binary checksum
   ansible.builtin.set_fact:
     k3s_checksum: >-
-      {{ k3s_checksums.content | regex_findall('(?m)^([0-9a-f]{64})\\s+\\*?' ~ k3s_artifact ~ '$') }}
+      {{ k3s_checksums.content | regex_findall('(?m)^([0-9a-f]{64}) +[*]?' ~ k3s_artifact ~ '$') }}
 
 - name: Require one matching release checksum
   ansible.builtin.assert:

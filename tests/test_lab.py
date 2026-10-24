@@ -145,6 +145,24 @@ class OfflineTests(unittest.TestCase):
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[:2], ("output", "-json"))
 
+    def test_k3s_checksum_selection_with_ansible(self):
+        tasks = yaml.safe_load((ROOT / "ansible/roles/k3s/tasks/main.yml").read_text())
+        selection = next(task for task in tasks if task["name"] == "Select the exact binary checksum")
+        for artifact in ("k3s", "k3s-arm64"):
+            with self.subTest(artifact=artifact):
+                checksum = "a" * 64
+                content = checksum + "  " + artifact + "\n" + "b" * 64 + " *" + artifact + "-other\n"
+                play = [{"name": "Check checksum selection", "hosts": "localhost",
+                         "gather_facts": False, "vars": {
+                             "k3s_artifact": artifact, "k3s_checksums": {"content": content}},
+                         "tasks": [selection, {"name": "Require exact checksum",
+                                              "ansible.builtin.assert": {
+                                                  "that": "k3s_checksum == ['" + checksum + "']"}}]}]
+                path = lab.STATE / "checksum-test.yml"
+                path.write_text(yaml.safe_dump(play), encoding="ascii")
+                subprocess.run(["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+                               cwd=ROOT, check=True, capture_output=True, text=True)
+
     def test_k3s_and_route_templates_for_every_mode(self):
         rendered = lab.STATE / "rendered"
         rendered.mkdir(exist_ok=True)
