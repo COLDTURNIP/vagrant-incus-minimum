@@ -59,3 +59,18 @@ run "reject_default_project" {
   variables { project = "default" }
   expect_failures = [var.project]
 }
+
+run "official_cloud_image" {
+  command = plan
+  variables {
+    bootstrap_agent = true
+    image           = "ubuntu-noble-official"
+  }
+  assert {
+    condition = length([
+      for device in incus_instance.node["server"].device : device
+      if contains(["agent", "cloud-init"], device.name)
+    ]) == 2 && length(yamldecode(trimprefix(incus_instance.node["server"].config["cloud-init.user-data"], "#cloud-config\n")).bootcmd) == 4
+    error_message = "Stock cloud images require cloud-init/agent config disks and agent bootstrap."
+  }
+}

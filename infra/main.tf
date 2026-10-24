@@ -96,6 +96,12 @@ resource "incus_instance" "node" {
       manage_etc_hosts = true
       package_update   = true
       packages         = ["python3", "python3-apt"]
+      bootcmd = var.bootstrap_agent ? [
+        ["mkdir", "-p", "/mnt/incus-agent"],
+        ["mount", "/dev/disk/by-label/incus-agent", "/mnt/incus-agent"],
+        ["sh", "-c", "cd /mnt/incus-agent && ./install.sh"],
+        ["umount", "/mnt/incus-agent"],
+      ] : []
     })])
     "cloud-init.network-config" = yamlencode({
       version = 2
@@ -117,6 +123,14 @@ resource "incus_instance" "node" {
         }
       }
     })
+  }
+  dynamic "device" {
+    for_each = var.bootstrap_agent ? toset(["agent", "cloud-init"]) : toset([])
+    content {
+      name       = device.value
+      type       = "disk"
+      properties = { source = device.value == "agent" ? "agent:config" : "cloud-init:config" }
+    }
   }
   device {
     name = "management"

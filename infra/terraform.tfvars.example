@@ -2,6 +2,8 @@
 project                = "lh-incus"
 storage_pool           = "default"
 image                  = "images:ubuntu/24.04/cloud"
+# Stock Ubuntu images need config-drive agent bootstrap; see docs/official-ubuntu-image.md.
+# bootstrap_agent = true
 network_stack          = "dual" # ipv4, ipv6, dual, dual6
 worker_count           = 3
 enable_v2              = true

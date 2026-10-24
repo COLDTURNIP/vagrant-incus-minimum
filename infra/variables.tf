@@ -120,3 +120,9 @@ variable "shared_directory" {
     error_message = "Use an absolute path on the Incus host, or an empty string."
   }
 }
+
+variable "bootstrap_agent" {
+  description = "Bootstrap the Incus agent via config disks for stock Ubuntu cloud images."
+  type        = bool
+  default     = false
+}
