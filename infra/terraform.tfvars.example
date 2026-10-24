@@ -1,11 +1,8 @@
 # Copy to terraform.tfvars (ignored). Review every network for host/VPN overlap.
 project                = "lh-incus"
 storage_pool           = "default"
-image                  = "images:ubuntu/24.04/cloud"
-# Stock Ubuntu images need config-drive agent bootstrap; see docs/official-ubuntu-image.md.
-# bootstrap_agent = true
-network_stack          = "dual" # ipv4, ipv6, dual, dual6
+# image, bootstrap_agent, network_stack and enable_storage_network come from
+# cluster.yml; scripts/lab.py passes them with -var-file, overriding this file.
 worker_count           = 3
 enable_v2              = true
-enable_storage_network = false
 # shared_directory = "/absolute/path/on/incus/host"

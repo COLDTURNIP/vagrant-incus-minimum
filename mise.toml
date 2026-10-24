@@ -80,6 +80,21 @@ run = [
 description = "Run all local-only validation; never contact Incus or Kubernetes"
 depends = ["validate:ansible"]
 
+[tasks.up]
+description = "Create and provision the cluster described by cluster.yml then verify; --confirm PROJECT required"
+dir = "{{config_root}}"
+run = "python scripts/lab.py up"
+
+[tasks.down]
+description = "DELETE the cluster (same as destroy); --confirm PROJECT required"
+dir = "{{config_root}}"
+run = "python scripts/lab.py down"
+
+[tasks."image:import"]
+description = "Import Canonical's checksum-verified Ubuntu cloud image for image_source: official"
+dir = "{{config_root}}"
+run = "python scripts/lab.py import-image"
+
 [tasks.init]
 description = "Initialize OpenTofu provider and state metadata; no VMs"
 dir = "{{config_root}}"

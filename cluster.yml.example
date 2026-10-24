@@ -1,0 +1,49 @@
+# Cluster requirements for the Incus Longhorn lab. Copy to cluster.yml
+# (ignored) and edit.
+#
+# Launch:   mise run up -- --confirm lh-incus
+# Teardown: mise run down -- --confirm lh-incus
+#
+# Flags override any value for one run without changing this file:
+#   --ubuntu, --image-source, --k3s, --longhorn, --ip-family,
+#   --storage-network / --no-storage-network
+# Changing ubuntu, image_source, ip_family or storage_network, or switching
+# longhorn between a release and master-head, needs a fresh cluster: run down,
+# then up. K3s and Longhorn downgrades are refused.
+
+# Ubuntu release for every VM. Quote it ("24.04", not 24.04).
+# Values: an Ubuntu release with cloud images, for example "22.04", "24.04",
+# "26.04". V2 needs a 6.7+ guest kernel, so "22.04" fails while V2 is enabled.
+ubuntu: "24.04"
+
+# Where the VM image comes from.
+# Values:
+#   images   - images:ubuntu/<ubuntu>/cloud from the linuxcontainers.org remote
+#   official - Canonical's cloud image, imported once per release with
+#              mise run image:import (use when "images" boot-loops)
+image_source: images
+
+# K3s release.
+# Values: a K3s release tag vX.Y.Z+k3sN, for example v1.34.2+k3s1. See
+# https://github.com/k3s-io/k3s/releases
+k3s: v1.34.2+k3s1
+
+# Longhorn version.
+# Values:
+#   vX.Y.Z      - a released version, installed with the Helm chart from
+#                 https://charts.longhorn.io, for example v1.13.0
+#   master-head - nightly images, installed from deploy/longhorn.yaml on the
+#                 longhorn/longhorn master branch
+longhorn: v1.13.0
+
+# IP family for node, pod and service addresses (management stays IPv4).
+# Values:
+#   ipv4-single - IPv4 only
+#   ipv6-single - IPv6 only
+#   ipv4-dual   - dual stack, IPv4 primary
+#   ipv6-dual   - dual stack, IPv6 primary
+ip_family: ipv4-dual
+
+# Dedicated Multus storage network for Longhorn replica traffic.
+# Values: true or false
+storage_network: false

@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
-"""Guarded local Incus lifecycle. No third-party Python dependencies."""
+"""Guarded local Incus lifecycle driven by cluster.yml. Runs inside the project venv."""
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
+import platform
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import time
+import urllib.request
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state"
 PLAN = STATE / "infra.tfplan"
 INVENTORY = STATE / "inventory.json"
+SPEC_EXAMPLE = ROOT / "cluster.yml.example"
+SPEC_FILE = ROOT / "cluster.yml"
+TF_SPEC = STATE / "cluster.tfvars.json"
+ANSIBLE_SPEC = STATE / "cluster-vars.json"
+APPLIED_SPEC = STATE / "applied-cluster.json"
+IP_FAMILIES = {"ipv4-single": "ipv4", "ipv6-single": "ipv6", "ipv4-dual": "dual", "ipv6-dual": "dual6"}
+IMAGE_SOURCES = ("images", "official")
+# Changing these replaces VMs or the network layout, which apply refuses.
+RECREATE_KEYS = ("ubuntu", "image_source", "ip_family", "storage_network")
+OFFICIAL_IMAGES = "https://cloud-images.ubuntu.com/releases/{ubuntu}/release/"
 
 
 def run(args, *, capture=False):
@@ -34,16 +52,160 @@ def private_directory():
     STATE.chmod(0o700)
 
 
-def inventory():
-    data = json.loads(tofu("output", "-json", "inventory", capture=True))
+def write_private_json(path, data):
     private_directory()
-    temporary = INVENTORY.with_suffix(".tmp")
+    temporary = path.with_suffix(".tmp")
     # Restrict permissions at creation, not after writing.
     with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
         json.dump(data, stream, indent=2)
         stream.write("\n")
-    temporary.replace(INVENTORY)
+    temporary.replace(path)
+
+
+def inventory():
+    data = json.loads(tofu("output", "-json", "inventory", capture=True))
+    write_private_json(INVENTORY, data)
     return data
+
+
+def load_spec(overrides=None):
+    """cluster.yml.example supplies defaults; cluster.yml and per-run flags override them."""
+    spec = yaml.safe_load(SPEC_EXAMPLE.read_text())
+    if SPEC_FILE.exists():
+        local = yaml.safe_load(SPEC_FILE.read_text()) or {}
+        unknown = sorted(set(local) - set(spec))
+        if unknown:
+            raise ValueError("Unknown cluster.yml keys: " + ", ".join(unknown))
+        spec.update(local)
+    spec.update({key: value for key, value in (overrides or {}).items() if value is not None})
+    if isinstance(spec["ubuntu"], float):
+        # An unquoted 24.04 is a YAML float.
+        spec["ubuntu"] = f"{spec['ubuntu']:.2f}"
+    checks = (
+        ("ubuntu", re.fullmatch(r"\d{2}\.\d{2}", str(spec["ubuntu"])), "a release such as \"24.04\""),
+        ("image_source", spec["image_source"] in IMAGE_SOURCES, " or ".join(IMAGE_SOURCES)),
+        ("k3s", re.fullmatch(r"v\d+\.\d+\.\d+\+k3s\d+", str(spec["k3s"])), "for example v1.34.2+k3s1"),
+        ("longhorn", re.fullmatch(r"v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?|master-head", str(spec["longhorn"])),
+         "vX.Y.Z or master-head"),
+        ("ip_family", spec["ip_family"] in IP_FAMILIES, ", ".join(IP_FAMILIES)),
+        ("storage_network", isinstance(spec["storage_network"], bool), "true or false"),
+    )
+    for key, valid, expected in checks:
+        if not valid:
+            raise ValueError(f"Invalid {key}: {spec[key]!r}; expected {expected}")
+    return spec
+
+
+def official_alias(ubuntu):
+    return f"ubuntu-{ubuntu}-official"
+
+
+def resolve_image(spec):
+    """Return the OpenTofu image reference and whether config-drive agent bootstrap is needed."""
+    if spec["image_source"] == "images":
+        return f"images:ubuntu/{spec['ubuntu']}/cloud", False
+    alias = official_alias(spec["ubuntu"])
+    images = json.loads(run(["incus", "image", "list", "local:", "--project", "default",
+                             "--format", "json"], capture=True))
+    for image in images:
+        if any(item["name"] == alias for item in image.get("aliases") or []):
+            # A bare local fingerprint; a remote-qualified alias needs a network listener.
+            return image["fingerprint"], True
+    raise ValueError(f"Image alias {alias} not found; run: mise run image:import -- --ubuntu {spec['ubuntu']}")
+
+
+def write_tofu_spec(spec):
+    image, bootstrap_agent = resolve_image(spec)
+    write_private_json(TF_SPEC, {
+        "image": image,
+        "bootstrap_agent": bootstrap_agent,
+        "network_stack": IP_FAMILIES[spec["ip_family"]],
+        "enable_storage_network": spec["storage_network"],
+    })
+    return TF_SPEC
+
+
+def write_ansible_spec(spec):
+    write_private_json(ANSIBLE_SPEC, {"k3s_version": spec["k3s"], "longhorn_version": spec["longhorn"]})
+    return ANSIBLE_SPEC
+
+
+def applied_spec():
+    """The spec recorded at the last apply, if infrastructure still exists in state."""
+    if not APPLIED_SPEC.exists() or not tofu("state", "list", capture=True).strip():
+        return None
+    return json.loads(APPLIED_SPEC.read_text())
+
+
+def release(version):
+    """Numeric release tuple of v1.34.2+k3s1 or v1.13.0; suffixes are ignored."""
+    return tuple(int(part) for part in re.findall(r"\d+", version.split("-")[0]))
+
+
+def refuse_recreation(spec, applied):
+    if not applied:
+        return
+    changed = [f"{key} {applied[key]!r} -> {spec[key]!r}" for key in RECREATE_KEYS
+               if key in applied and applied[key] != spec[key]]
+    if "longhorn" in applied and (applied["longhorn"] == "master-head") != (spec["longhorn"] == "master-head"):
+        changed.append(f"longhorn {applied['longhorn']!r} -> {spec['longhorn']!r} (Helm vs manifest)")
+    for key in ("k3s", "longhorn"):
+        if key in applied and "master-head" not in (applied[key], spec[key]) \
+                and release(spec[key]) < release(applied[key]):
+            changed.append(f"{key} {applied[key]!r} -> {spec[key]!r} (downgrades are unsupported)")
+    if changed:
+        raise ValueError("These changes need a fresh cluster: " + "; ".join(changed)
+                         + ". Run mise run down -- --confirm PROJECT, then mise run up.")
+
+
+def record_applied(spec, *keys):
+    data = json.loads(APPLIED_SPEC.read_text()) if APPLIED_SPEC.exists() else {}
+    data.update({key: spec[key] for key in keys})
+    write_private_json(APPLIED_SPEC, data)
+
+
+def import_image(spec):
+    """Import Canonical's checksum-verified cloud image as ubuntu-<version>-official."""
+    alias = official_alias(spec["ubuntu"])
+    existing = json.loads(run(["incus", "image", "list", "local:", "--project", "default",
+                               "--format", "json"], capture=True))
+    if any(item["name"] == alias for image in existing for item in image.get("aliases") or []):
+        print(f"Image alias {alias} already exists; not re-importing", file=sys.stderr)
+        return
+    machine = platform.machine()
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine)
+    if not arch:
+        raise ValueError(f"Unsupported host architecture {machine}")
+    name = f"ubuntu-{spec['ubuntu']}-server-cloudimg-{arch}.img"
+    base = OFFICIAL_IMAGES.format(ubuntu=spec["ubuntu"])
+    # Downloads are data only and get their own directory.
+    directory = STATE / "official-image" / spec["ubuntu"]
+    private_directory()
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with urllib.request.urlopen(base + "SHA256SUMS", timeout=60) as response:
+        sums = response.read().decode("ascii")
+    expected = [line.split()[0] for line in sums.splitlines() if line.split()[-1].lstrip("*") == name]
+    if len(expected) != 1:
+        raise ValueError(f"{name} is not listed in {base}SHA256SUMS")
+    image = directory / name
+    urllib.request.urlretrieve(base + name, image)
+    digest = hashlib.sha256()
+    with image.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected[0]:
+        image.unlink()
+        raise ValueError(f"Checksum mismatch for {name}")
+    metadata = directory / "metadata.yaml"
+    metadata.write_text(yaml.safe_dump({
+        "architecture": machine, "creation_date": int(time.time()),
+        "properties": {"description": f"Official Ubuntu {spec['ubuntu']} cloud image with config-drive agent bootstrap",
+                       "os": "Ubuntu", "release": spec["ubuntu"]},
+    }), encoding="ascii")
+    with tarfile.open(directory / "metadata.tar.xz", "w:xz") as archive:
+        archive.add(metadata, arcname="metadata.yaml")
+    run(["incus", "image", "import", directory / "metadata.tar.xz", image,
+         "--alias", alias, "--project", "default"])
 
 
 def walk_resources(module):
@@ -133,9 +295,10 @@ def preflight(plan):
     return project
 
 
-def plan_infrastructure(*, destroy=False):
+def plan_infrastructure(*, destroy=False, var_file=None):
     private_directory()
-    tofu("plan", "-input=false", *(["-destroy"] if destroy else []), "-out=" + str(PLAN))
+    tofu("plan", "-input=false", *(["-destroy"] if destroy else []),
+         *(["-var-file=" + str(var_file)] if var_file else []), "-out=" + str(PLAN))
     return json.loads(tofu("show", "-json", str(PLAN), capture=True))
 
 
@@ -144,44 +307,87 @@ def require_confirmation(actual, supplied):
         raise ValueError(f"Explicit confirmation required: --confirm {actual}")
 
 
-def provision(playbook="site.yml"):
+def provision(spec, playbook="site.yml"):
     inventory()
     args = ["ansible-playbook", "-i", INVENTORY, ROOT / "ansible" / playbook]
     local_vars = ROOT / "ansible" / "vars.local.yml"
     if local_vars.exists():
         args += ["--extra-vars", "@" + str(local_vars)]
+    # Later extra vars win: cluster.yml selects the K3s and Longhorn versions.
+    args += ["--extra-vars", "@" + str(write_ansible_spec(spec))]
     run(args)
+
+
+def apply_infrastructure(spec, confirm):
+    refuse_recreation(spec, applied_spec())
+    plan = plan_infrastructure(var_file=write_tofu_spec(spec))
+    project = preflight(plan)
+    refuse_deletions(plan)
+    require_confirmation(project, confirm)
+    tofu("apply", "-input=false", str(PLAN))
+    record_applied(spec, *RECREATE_KEYS)
+    inventory()
+
+
+def destroy(confirm):
+    topology = json.loads(tofu("output", "-json", "topology", capture=True))
+    require_confirmation(topology["project"], confirm)
+    plan_infrastructure(destroy=True)
+    tofu("apply", "-input=false", str(PLAN))
+    INVENTORY.unlink(missing_ok=True)
+    APPLIED_SPEC.unlink(missing_ok=True)
+    (ROOT / "shared" / "k3s.config").unlink(missing_ok=True)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["init", "plan", "apply", "inventory", "provision", "verify", "destroy"])
-    parser.add_argument("--confirm", help="Exact project name for apply or destructive destroy")
+    parser.add_argument("command", choices=["init", "plan", "apply", "inventory", "provision", "verify",
+                                            "destroy", "up", "down", "import-image"])
+    parser.add_argument("--confirm", help="Exact project name for apply, up, or destructive destroy/down")
+    overrides = parser.add_argument_group("per-run overrides of cluster.yml (not persisted)")
+    overrides.add_argument("--ubuntu", help="Ubuntu release, for example 24.04")
+    overrides.add_argument("--image-source", choices=IMAGE_SOURCES)
+    overrides.add_argument("--k3s", help="K3s release, for example v1.34.2+k3s1")
+    overrides.add_argument("--longhorn", help="vX.Y.Z (Helm) or master-head (manifest)")
+    overrides.add_argument("--ip-family", choices=list(IP_FAMILIES))
+    overrides.add_argument("--storage-network", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args(argv)
     for program in ("tofu", "incus", "ip", "ansible-playbook"):
         if not shutil.which(program):
             raise ValueError(f"Missing required command: {program}; run through mise")
-    if args.command == "init":
-        tofu("init", "-input=false")
-    elif args.command in ("plan", "apply"):
-        plan = plan_infrastructure()
-        project = preflight(plan)
-        if args.command == "apply":
-            refuse_deletions(plan)
-            require_confirmation(project, args.confirm)
-            tofu("apply", "-input=false", str(PLAN))
+    if args.command in ("destroy", "down"):
+        # Teardown uses state only, so an invalid cluster.yml cannot block it.
+        destroy(args.confirm)
+        return
+    if args.command in ("init", "inventory"):
+        if args.command == "init":
+            tofu("init", "-input=false")
+        else:
             inventory()
-    elif args.command == "inventory":
-        inventory()
-    elif args.command in ("provision", "verify"):
-        provision("verify.yml" if args.command == "verify" else "site.yml")
-    elif args.command == "destroy":
-        topology = json.loads(tofu("output", "-json", "topology", capture=True))
-        require_confirmation(topology["project"], args.confirm)
-        plan_infrastructure(destroy=True)
-        tofu("apply", "-input=false", str(PLAN))
-        INVENTORY.unlink(missing_ok=True)
-        (ROOT / "shared" / "k3s.config").unlink(missing_ok=True)
+        return
+    spec = load_spec({"ubuntu": args.ubuntu, "image_source": args.image_source, "k3s": args.k3s,
+                      "longhorn": args.longhorn, "ip_family": args.ip_family,
+                      "storage_network": args.storage_network})
+    print("Cluster: " + json.dumps(spec, sort_keys=True), file=sys.stderr)
+    if args.command == "import-image":
+        import_image(spec)
+    elif args.command == "plan":
+        refuse_recreation(spec, applied_spec())
+        preflight(plan_infrastructure(var_file=write_tofu_spec(spec)))
+    elif args.command == "apply":
+        apply_infrastructure(spec, args.confirm)
+    elif args.command == "provision":
+        refuse_recreation(spec, applied_spec())
+        provision(spec)
+        record_applied(spec, "k3s", "longhorn")
+    elif args.command == "verify":
+        provision(spec, "verify.yml")
+    elif args.command == "up":
+        tofu("init", "-input=false")
+        apply_infrastructure(spec, args.confirm)
+        provision(spec)
+        record_applied(spec, "k3s", "longhorn")
+        provision(spec, "verify.yml")
 
 
 if __name__ == "__main__":

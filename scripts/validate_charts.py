@@ -8,11 +8,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_URL = "https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml"
+example = yaml.safe_load((ROOT / "cluster.yml.example").read_text())
+local = ROOT / "cluster.yml"
+selected = (yaml.safe_load(local.read_text()) or {}) if local.exists() else {}
 defaults = yaml.safe_load((ROOT / "ansible/group_vars/all.yml").read_text())
-local = ROOT / "ansible/vars.local.yml"
-overrides = yaml.safe_load(local.read_text()) if local.exists() else None
 # Validate the tracked default and, when different, the locally selected version.
-versions = sorted({defaults["longhorn_version"], (overrides or {}).get("longhorn_version", defaults["longhorn_version"])})
+versions = sorted({example["longhorn"], selected.get("longhorn", example["longhorn"])})
 charts = ROOT / ".state/charts"
 charts.mkdir(parents=True, exist_ok=True)
 values_files = sorted((ROOT / ".state/rendered").glob("longhorn-*-v2-*.yml"))

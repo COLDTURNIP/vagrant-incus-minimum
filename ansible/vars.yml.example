@@ -1,8 +1,6 @@
 ---
 # Copy to vars.local.yml (ignored). Guest-only settings do not recreate VMs.
-k3s_version: v1.34.2+k3s1
-# vX.Y.Z uses the Helm chart; master-head applies the master branch manifest.
-longhorn_version: v1.13.0
+# k3s and longhorn versions come from cluster.yml.
 install_longhorn: true
 backup_target: garage
 v2_hugepages: false

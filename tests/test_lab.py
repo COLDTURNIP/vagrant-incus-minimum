@@ -5,7 +5,9 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +40,16 @@ class OfflineTests(unittest.TestCase):
         cls.environment.filters["hash"] = lambda value, algorithm: __import__("hashlib").new(
             algorithm, value.encode()).hexdigest()
         cls.environment.globals["lookup"] = lambda *args: "offline-test-certificate"
+
+    def setUp(self):
+        # Never read the developer's cluster.yml or touch the real spec files.
+        scratch = Path(tempfile.mkdtemp(dir=lab.STATE))
+        self.addCleanup(shutil.rmtree, scratch)
+        self.scratch = scratch
+        patcher = patch.multiple(lab, SPEC_FILE=scratch / "cluster.yml", TF_SPEC=scratch / "tf.json",
+                                 ANSIBLE_SPEC=scratch / "vars.json", APPLIED_SPEC=scratch / "applied.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def context(self, plan, hostname, target="garage"):
         inventory = plan["planned_values"]["outputs"]["inventory"]["value"]["all"]
@@ -144,6 +156,115 @@ class OfflineTests(unittest.TestCase):
             planning.assert_not_called()
             self.assertEqual(command.call_count, 1)
             self.assertEqual(command.call_args.args[:2], ("output", "-json"))
+
+    def test_cluster_spec_defaults_overrides_and_validation(self):
+        example = yaml.safe_load((ROOT / "cluster.yml.example").read_text())
+        self.assertEqual(lab.load_spec(), example)
+        self.assertEqual((self.defaults["k3s_version"], self.defaults["longhorn_version"]),
+                         (example["k3s"], example["longhorn"]), "group_vars defaults drifted from cluster.yml.example")
+        lab.SPEC_FILE.write_text("ubuntu: 26.04\nip_family: ipv6-dual\n")
+        spec = lab.load_spec({"longhorn": "master-head", "storage_network": True, "k3s": None})
+        self.assertEqual((spec["ubuntu"], spec["ip_family"], spec["longhorn"], spec["storage_network"], spec["k3s"]),
+                         ("26.04", "ipv6-dual", "master-head", True, example["k3s"]))
+        lab.SPEC_FILE.write_text("ubuntu_version: '24.04'\n")
+        with self.assertRaisesRegex(ValueError, "Unknown cluster.yml keys"):
+            lab.load_spec()
+        lab.SPEC_FILE.unlink()
+        for key, value in (("ubuntu", "noble"), ("image_source", "local"), ("k3s", "1.34.2"),
+                           ("longhorn", "master"), ("ip_family", "dual"), ("storage_network", "yes")):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "Invalid " + key):
+                lab.load_spec({key: value})
+
+    def test_cluster_spec_maps_to_tofu_and_ansible_variables(self):
+        for family, stack in lab.IP_FAMILIES.items():
+            with self.subTest(family=family):
+                lab.write_tofu_spec(lab.load_spec({"ip_family": family, "storage_network": True}))
+                self.assertEqual(json.loads(lab.TF_SPEC.read_text()), {
+                    "image": "images:ubuntu/24.04/cloud", "bootstrap_agent": False,
+                    "network_stack": stack, "enable_storage_network": True})
+        images = json.dumps([{"fingerprint": "f" * 64, "aliases": [{"name": "ubuntu-24.04-official"}]},
+                             {"fingerprint": "e" * 64, "aliases": None}])
+        with patch.object(lab, "run", return_value=images):
+            self.assertEqual(lab.resolve_image(lab.load_spec({"image_source": "official"})), ("f" * 64, True))
+            with self.assertRaisesRegex(ValueError, "image:import -- --ubuntu 26.04"):
+                lab.resolve_image(lab.load_spec({"image_source": "official", "ubuntu": "26.04"}))
+        lab.write_ansible_spec(lab.load_spec({"longhorn": "master-head"}))
+        self.assertEqual(json.loads(lab.ANSIBLE_SPEC.read_text()),
+                         {"k3s_version": lab.load_spec()["k3s"], "longhorn_version": "master-head"})
+
+    def test_recreation_changes_are_refused_before_planning(self):
+        applied = {**lab.load_spec(), "longhorn": "v1.13.0"}
+        for change in ({"ip_family": "ipv6-dual"}, {"storage_network": True}, {"ubuntu": "26.04"},
+                       {"image_source": "official"}, {"longhorn": "master-head"},
+                       {"longhorn": "v1.12.4"}, {"k3s": "v1.33.9+k3s1"}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "fresh cluster"):
+                lab.refuse_recreation({**applied, **change}, applied)
+        for change in ({"longhorn": "v1.14.0"}, {"longhorn": "v1.13.1-rc1"}, {"k3s": "v1.35.0+k3s1"},
+                       {"k3s": "v1.34.2+k3s2"}):
+            lab.refuse_recreation({**applied, **change}, applied)
+        lab.APPLIED_SPEC.write_text(json.dumps(applied))
+        with patch.object(lab, "tofu", return_value=""):
+            self.assertIsNone(lab.applied_spec(), "no resources in state means nothing to protect")
+        with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+             patch.object(lab, "tofu", return_value="incus_project.cluster\n"), \
+             patch.object(lab, "plan_infrastructure") as planning:
+            with self.assertRaisesRegex(ValueError, "ip_family 'ipv4-dual' -> 'ipv6-dual'"):
+                lab.main(["apply", "--confirm", "lh-incus", "--ip-family", "ipv6-dual"])
+            planning.assert_not_called()
+
+    def test_confirmed_apply_uses_cluster_var_file_and_records_it(self):
+        with patch.object(lab.shutil, "which", return_value="/bin/tool"), \
+             patch.object(lab, "plan_infrastructure", return_value=self.plans[0]) as planning, \
+             patch.object(lab, "preflight", return_value="lh-incus"), \
+             patch.object(lab, "inventory"), \
+             patch.object(lab, "tofu") as command:
+            lab.main(["apply", "--confirm", "lh-incus", "--storage-network"])
+        planning.assert_called_once_with(var_file=lab.TF_SPEC)
+        command.assert_called_once_with("apply", "-input=false", str(lab.PLAN))
+        recorded = json.loads(lab.APPLIED_SPEC.read_text())
+        self.assertEqual(set(recorded), set(lab.RECREATE_KEYS))
+        self.assertTrue(recorded["storage_network"])
+        with patch.object(lab, "tofu", side_effect=["", "{}"]) as command:
+            lab.plan_infrastructure(var_file=lab.TF_SPEC)
+        self.assertIn("-var-file=" + str(lab.TF_SPEC), command.call_args_list[0].args)
+
+    def test_official_image_import_verifies_checksum(self):
+        import hashlib
+        import io
+        payload = b"not really a disk image"
+        name = "ubuntu-26.04-server-cloudimg-amd64.img"
+        sums = (hashlib.sha256(payload).hexdigest() + " *" + name + "\n").encode()
+        spec = lab.load_spec({"ubuntu": "26.04"})
+        state = patch.object(lab, "STATE", self.scratch)
+        state.start()
+        self.addCleanup(state.stop)
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt), \
+                 patch.object(lab.platform, "machine", return_value="x86_64"), \
+                 patch.object(lab.urllib.request, "urlopen", return_value=io.BytesIO(sums)), \
+                 patch.object(lab.urllib.request, "urlretrieve",
+                              side_effect=lambda url, path: Path(path).write_bytes(payload + (b"!" if corrupt else b""))), \
+                 patch.object(lab, "run", return_value="[]") as command:
+                if corrupt:
+                    with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
+                        lab.import_image(spec)
+                    self.assertEqual(command.call_count, 1, "nothing is imported after a mismatch")
+                else:
+                    lab.import_image(spec)
+                    imported = [str(arg) for arg in command.call_args.args[0]]
+                    self.assertEqual(imported[:3], ["incus", "image", "import"])
+                    self.assertEqual(imported[-4:], ["--alias", "ubuntu-26.04-official", "--project", "default"])
+        with patch.object(lab, "run", return_value=json.dumps(
+                [{"fingerprint": "f" * 64, "aliases": [{"name": "ubuntu-26.04-official"}]}])) as command:
+            lab.import_image(spec)
+        self.assertEqual(command.call_count, 1, "an existing alias is not re-imported")
+
+    def test_provision_passes_cluster_versions_last(self):
+        with patch.object(lab, "inventory"), patch.object(lab, "run") as command:
+            lab.provision(lab.load_spec({"k3s": "v1.35.0+k3s1"}))
+        args = [str(arg) for arg in command.call_args.args[0]]
+        self.assertEqual(args[-2:], ["--extra-vars", "@" + str(lab.ANSIBLE_SPEC)])
+        self.assertEqual(json.loads(lab.ANSIBLE_SPEC.read_text())["k3s_version"], "v1.35.0+k3s1")
 
     def test_strict_longhorn_health_gate_with_ansible(self):
         playbook = yaml.safe_load((ROOT / "ansible/verify.yml").read_text())

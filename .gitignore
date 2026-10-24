@@ -21,3 +21,4 @@
 .env.*
 !.env.example
 /shared/
+/cluster.yml

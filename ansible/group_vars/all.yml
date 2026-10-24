@@ -1,4 +1,6 @@
 ---
+# Defaults for direct Ansible use; scripts/lab.py overrides k3s_version and
+# longhorn_version from cluster.yml (keep in sync with cluster.yml.example).
 k3s_version: v1.34.2+k3s1
 # A released version (vX.Y.Z) installs the pinned Helm chart from
 # charts.longhorn.io. master-head applies deploy/longhorn.yaml from the
